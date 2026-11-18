@@ -1,44 +1,33 @@
-# Raphael (v1.0)
+# Raphael (v2.0)
 
-Android (native Java) için hafif yapay zeka sohbet kabuğu. Gemini (gemini.google.com) ve AI Studio (aistudio.google.com) web arayüzlerini tek oturumlu arka plan WebView içinde çalıştırır.
+Android (native Java) hafif AI sohbet kabuğu. Gemini (`gemini.google.com`) ve AI Studio (`aistudio.google.com`) web arayüzlerini tek oturumlu arka plan WebView içinde çalıştırır.
 
-## Temel Özellikler (v1.0)
-- Sıfır harici bağımlılık, ~106 KB APK (Samsung Galaxy A8 / Android 8 / 3 GB RAM hedefli).
-- Dahili Markdown çizici (MdView): başlıklar, listeler, tablolar, ayrı kod kutuları ve her kod bloğunda Kopyala düğmesi.
-- Çoklu kaynak (Gemini ve AI Studio): tek WebView çerezleriyle geçiş, farklı modele veya eski sohbete geçince bağlam aktarımı.
-- Düşünme düzeyi seçimi (Varsayılan, Low, Medium, High; AI Studio için ek Extra High) ve AI Studio model seçici.
-- Dosya ekleme (+): metin/kod dosyaları mesaja gömülür; medya ve ikili dosyalar seçilir seçilmez siteye ön-yüklenir, AI Studio token bilgisi gösterilir, çipten silinince web sayfasından da kaldırılır.
-- Üretilen görselleri algılama (Shadow DOM ve lazy-load destekli), cookie/redirect uyumlu indirme, tam ekran görüntüleme ve paylaşma.
-- Yerel sohbet geçmişi (JSON), sohbet dışa aktarma (.md), Web sekmesinden canlı kontrol, arka plan görüntü aç/kapa, bağlantı kesme ve teşhis için DOM kaydet.
+## Ortam ve AI Geliştirme Kuralları
+- Hedef: Samsung Galaxy A8 (Android 8 / minSdk 26, targetSdk 34, 3 GB RAM), sıfır harici kütüphane.
+- Codespaces (Ubuntu): Geliştirici telefondan çalışır. Komutlar tek satırda ve tek kod bloğu içinde verilmeli (iç içe üçlü backtick kullanılmamalı), çıktı `rm -f kontrol.txt` sonrası `kontrol.txt` dosyasına yazılmalı; mobil yapıştırma için komutlar kısa tutulmalıdır.
+- Tasarım: Mevcut sıcak tema (`14.5sp`) ve Web sekmesindeki Arka plan görüntü kapalı modu RAM tasarrufu için korunmalıdır.
 
-## Kurulum ve APK Derleme (GitHub Codespaces)
-- İlk kurulum ve derleme (JDK 17, Android SDK 34, Gradle 8.4 otomatik kurulur): `bash build.sh` (çıktı: `Raphael.apk`).
-- Sonraki hızlı derlemeler: `./gradlew --no-daemon assembleDebug`.
+## v2.0 Özellikler
+- Gemini görseller: `inSkip()` ile `body.enable-mweb-header-mavatar` engeli aşıldı, `blob:` `<canvas>` yedeği ve Android 8 uyumlu AVIF-harici indirme eklendi.
+- AI Studio düşünme: Süreç cevaba karışmaz; açılır/kapanır `▸ Düşünüyor…` / `▸ Düşünce` kutucuğunda tutulur.
+- AI Studio token & Output: Üst çubukta toplam sohbet tokenı, gönderilen dosya yanında tokenı ve alt menüde `65K / 262K / 1M / Özel` Output ayarı (`maxOutputTokens`, varsayılan `65536`).
+- Kod blokları & hız: Tamamlanan blok önbelleği + adaptif yoklama; `260dp` kaydırmalı kod penceresi; doğrudan `Download/` kaydı için `İndir` (otomatik dil uzantısı) ve `Kopyala`.
+- HTML Preview koruması: AI Studio bitişte HTML bloğunu Preview moduna çevirse bile `WebSession` kodu kaybetmez, `aistudio.js` kod görünümüne çevirir ve `langOf()` `.title-text` okur.
+- Tam ekran görselde ayrı `Kaydet` (doğrudan `Download/`, Android 8 izin uyumlu) ve `Paylaş`; dosya ön-yükleme (`invalidateUploads`, `uploadGen`, `topAtts()`).
 
-## Proje Haritası (AI Asistanlar İçin Özet)
-- `app/src/main/java/com/raphael/app/MainActivity.java`: Ana arayüz, sohbet/web sekmesi, çekmece, model/düşünme menüsü, anlık dosya ön-yükleme (`pumpPreUpload`), akış sayacı, ayarlar.
-- `app/src/main/java/com/raphael/app/FileProv.java`: Paylaşım (`imgs/`, `export/`) ve WebView dosya yükleme (`up/`) için dahili ContentProvider (`com.raphael.app.files`).
-- `app/src/main/java/com/raphael/app/core/Site.java`: Desteklenen siteler (`GEMINI`, `AISTUDIO`). Yeni site = yeni enum + `assets/js/<site>.js`.
-- `app/src/main/java/com/raphael/app/core/WebSession.java`: WebView yönetimi, UA seçimi (Chrome/Firefox), `AndroidBridge` köprüsü, `window.__rph` komutları, yanıt izleme, görsel indirme, DOM kaydı.
-- `app/src/main/java/com/raphael/app/ui/MdView.java` & `Ui.java`: Kütüphanesiz Markdown çizici ve tema yardımcıları.
-- `app/src/main/java/com/raphael/app/data/Chat.java`, `Msg.java`, `ChatStore.java`: Sohbet geçmişi (`files/chats/`) ve görseller (`files/imgs/`).
-- `app/src/main/assets/js/common.js`: Ortak DOM/Markdown motoru, Shadow DOM uyumlu düşünme filtresi (`isThNode`/`inTh`), görsel tarayıcı (`imgsIn`), parça parça dosya ekleme (`ops.attach`), dosya kaldırma (`ops.removeAttach`), DOM dışa aktarma (`ops.dom`).
-- `app/src/main/assets/js/gemini.js` & `aistudio.js`: Sitelere özel `CFG` seçicileri, gönderim (`ops.send`), düşünme düzeyi (`ops.setThinking`), model seçici (`ops.listModels`, `ops.setModel`), üretim takibi (`isGen`, `state`).
-- `app/src/main/AndroidManifest.xml`, `app/src/main/res/`, `build.sh`: İzinler (`INTERNET`), `configChanges` koruması, vektör ikonlar ve derleme betiği.
+## Kurulum ve Derleme (Codespaces)
+- İlk kurulum ve derleme (JDK 17, Android SDK 34, Gradle 8.4): `bash build.sh` (çıktı: `Raphael.apk`). Sonraki: `./gradlew --no-daemon assembleDebug`.
+- Temiz kaynak zip açıp sıfırdan derleme (`raphael-v2-kaynak.zip`): `cd "$(git rev-parse --show-toplevel)" && find . -mindepth 1 -maxdepth 1 ! -name .git ! -name raphael-v2-kaynak.zip -exec rm -rf {} + && unzip -oq raphael-v2-kaynak.zip && rm -f raphael-v2-kaynak.zip && bash build.sh`
+- AI sohbetine `.js/.xml/.sh` dahil tek `.txt` almak için: `{ for f in build.sh build.gradle settings.gradle gradle.properties app/build.gradle app/src/main/AndroidManifest.xml app/src/main/res/values/styles.xml app/src/main/assets/js/*.js app/src/main/java/com/raphael/app/*.java app/src/main/java/com/raphael/app/*/*.java; do echo "=== $f ==="; cat "$f"; done; } > tum_kod.txt`
 
-## AI Sohbetine Eksiksiz Kod Verme Notu
-Bazı AI sohbet arayüzleri `.zip` içindeki `.js`, `.xml` ve `.sh` dosyalarını filtreleyebilir. Tüm kaynak kodunu tek `.txt` halinde almak için Codespaces içinde şu komutu kullanabilirsiniz:
-`{ for f in build.sh build.gradle settings.gradle gradle.properties app/build.gradle app/src/main/AndroidManifest.xml app/src/main/res/values/styles.xml app/src/main/assets/js/*.js app/src/main/java/com/raphael/app/*.java app/src/main/java/com/raphael/app/*/*.java; do echo "=== $f ==="; cat "$f"; done; } > tum_kod.txt`
+## Dosya Haritası
+- `MainActivity.java`: Ana arayüz, sohbet/web sekmesi, model/düşünme/output menüsü, `pumpPreUpload`, düşünme kutucuğu, doğrudan `Download/` kayıt.
+- `FileProv.java`: `imgs/`, `export/`, `up/` ContentProvider (`com.raphael.app.files`).
+- `core/Site.java`, `core/WebSession.java`: Site tanımları, WebView yaşam döngüsü, `AndroidBridge`, adaptif takip, kod koruma, görsel indirme.
+- `ui/MdView.java`, `ui/Ui.java`: Dahili Markdown çizici (`260dp` kod kutusu + `İndir`/`Kopyala`), tema yardımcıları.
+- `data/Chat.java`, `Msg.java`, `ChatStore.java`: Sohbet JSON geçmişi (`files/chats/`) ve görseller (`files/imgs/`).
+- `assets/js/common.js`, `gemini.js`, `aistudio.js`: Önbellekli DOM->Markdown, `inTh`/`inSkip`/`inGenBox`, `blob:` canvas, dosya yükleme/silme, AI Studio token/output/preview.
+- `AndroidManifest.xml`, `res/`, `build.sh`: İzinler (`INTERNET`, API<=28 `WRITE_EXTERNAL_STORAGE`), `configChanges`, ikonlar, derleme betiği.
 
-## v1 Bilinen Sınırlamalar (v2 İlk Düzeltme Listesi)
-Bu sürüm kararlı v1 referansı olarak dondurulmuştur; aşağıdaki bilinen kenar durumlar v2 geliştirme sürecinde ele alınacaktır:
-1. `MainActivity`: Bağlantıyı kes -> Bağlan veya Yenile sonrası, ya da başka sohbete geçip 2. dosya eklendiğinde ön-yüklenmiş (`upState=2`) dosyaların durumu sıfırlanmadığı için gönderimde atlanabilmesi.
-2. `MainActivity`: AI cevap yazarken (`generating=true`) eklenen dosyalar için `finishAi`/`failAi` bitişinde `pumpPreUpload` çağrılmadığından dosyanın `loading…` durumunda kalabilmesi.
-3. `WebSession`: `open()` içinde eski `queue` kuyruğu temizlenmediği için sayfa açılırken site değiştirildiğinde çift yükleme yarışması oluşabilmesi.
-4. `MainActivity`: Yüklenmekte olan dosya `x` ile silinip hemen Gönder basıldığında `activeUpload` çakışması; `resendLast()` içinde ön-yüklenmiş dosyaların tekrar yüklenmemesi.
-5. `common.js`: Gemini görsel önizlemelerinde `ATT_SEL` kapsayıcı + `img[src^="blob:"]` çift eşleşmesi yüzünden `ops.removeAttach` işleminin başarısız olabilmesi.
-
-## Uzun Vadeli Plan
-- 1. Aşama devamı: v2 hata düzeltmeleri, ChatGPT ve DeepSeek sürücüleri, genel token sayacı ve isteğe bağlı daha kompakt arayüz.
-- 2. Aşama: Yerel `raphael` klasörü üzerinde dosya araçları.
-- 3. Aşama: Çoklu model ajan orkestrasyonu.
+## Yol Haritası
+- 1. Aşama devamı: `ChatGPT` ve `DeepSeek` sürücüleri. 2. Aşama: Yerel `raphael` klasörü dosya araçları. 3. Aşama: Çoklu model ajan orkestrasyonu.

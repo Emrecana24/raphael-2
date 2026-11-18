@@ -2,6 +2,7 @@ package com.raphael.app.core;
 
 import android.content.Context;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.net.Uri;
 import android.util.Base64;
 import android.webkit.ValueCallback;
@@ -52,6 +53,7 @@ public class WebSession {
         void onNote(String msg);
         void onImages(List<String> names);
         void onStage(String text);
+        void onThinking(String text, boolean active);
         /** true dönerse sistem dosya seçicisini aktivite açar. */
         boolean onFileChooser(ValueCallback<Uri[]> cb, WebChromeClient.FileChooserParams p);
     }
@@ -80,9 +82,9 @@ public class WebSession {
     private int status = ST_OFF;
     private String info = "";
     private boolean usable = false, fresh = false, prefsApplied = false, applying = false;
-    private boolean destroyed = false;
+    private boolean destroyed = false, pendingOutReset = false;
     private int readyTries = 0, uaMode = 0;
-    private String prefThinking = "", prefModel = "";
+    private String prefThinking = "", prefModel = "", prefMaxOut = "", lastTokens = "";
     private final Map<String, String> scriptCache = new HashMap<>();
     private final List<Runnable> queue = new ArrayList<>();
     private final Map<String, OpCb> ops = new HashMap<>();
@@ -92,7 +94,8 @@ public class WebSession {
     private boolean tracking = false;
     private int trackM0 = 0, stable = 0;
     private long trackStart = 0;
-    private String sig = "", lastText = "", sentText = "";
+    private String sig = "", lastText = "", sentText = "", lastTh = "";
+    private boolean lastThOn = false;
     private boolean noReplyReported = false;
     private int idleBad = 0;
     private String baseSig = "", dbg = "", curUa = "";
@@ -110,6 +113,7 @@ public class WebSession {
     public Site site() { return site; }
     public int status() { return status; }
     public String info() { return info; }
+    public String tokens() { return site == Site.AISTUDIO ? lastTokens : ""; }
     public boolean isUsable() { return usable; }
     public boolean isFresh() { return fresh; }
     public boolean isConnected() { return web != null; }
@@ -119,7 +123,7 @@ public class WebSession {
 
     public void attach(FrameLayout host) { this.host = host; }
 
-    public void setPrefs(String thinking, String model) { prefThinking = thinking == null ? "" : thinking; prefModel = model == null ? "" : model; }
+    public void setPrefs(String thinking, String model, String maxOut) { prefThinking = thinking == null ? "" : thinking; prefModel = model == null ? "" : model; prefMaxOut = maxOut == null ? "" : maxOut; }
 
     // ------------------------------------------------------------------ WebView
     @SuppressWarnings("SetJavaScriptEnabled")
@@ -191,12 +195,25 @@ public class WebSession {
     }
 
     /** Siteyi (yeni sohbet sayfasını) yükler. */
+    private void clearOps(String err) {
+        pendingUris.clear();
+        if (ops.isEmpty()) return;
+        List<OpCb> list = new ArrayList<>(ops.values());
+        ops.clear();
+        JSONObject r = new JSONObject();
+        try { r.put("ok", false).put("err", err); } catch (Exception ignored) {}
+        for (OpCb cb : list) cb.done(r);
+    }
+
     public void open(Site s, String url) {
         destroyed = false;
         site = s;
         ensureWeb();
         if (web == null) return;
         stopTracking();
+        queue.clear();
+        lastTokens = "";
+        clearOps("sayfa-degisti");
         usable = false; fresh = true; prefsApplied = false;
         applyUa();
         setStatus(ST_LOADING, "Yükleniyor…");
@@ -209,6 +226,9 @@ public class WebSession {
     public void loginPage() {
         ensureWeb();
         if (web == null) return;
+        queue.clear();
+        lastTokens = "";
+        clearOps("giris-sayfasi");
         applyUa();
         usable = false;
         String cont = android.net.Uri.encode(site.newChatUrl);
@@ -221,6 +241,8 @@ public class WebSession {
         h.removeCallbacks(tickR);
         usable = false; fresh = false;
         queue.clear();
+        lastTokens = "";
+        clearOps("baglanti-kesildi");
         if (web != null) {
             try { web.loadUrl("about:blank"); web.stopLoading(); } catch (Throwable ignored) {}
             if (host != null) host.removeView(web);
@@ -347,6 +369,10 @@ public class WebSession {
     }
 
     private synchronized String writeImage(String mime, byte[] data) throws Exception {
+        BitmapFactory.Options bo = new BitmapFactory.Options();
+        bo.inJustDecodeBounds = true;
+        BitmapFactory.decodeByteArray(data, 0, data.length, bo);
+        if (bo.outWidth <= 0 || bo.outHeight <= 0) return "";
         File dir = new File(ctx.getFilesDir(), "imgs");
         dir.mkdirs();
         String ext = mime != null && mime.contains("jpeg") ? "jpg" : mime != null && mime.contains("webp") ? "webp" : mime != null && mime.contains("gif") ? "gif" : "png";
@@ -365,13 +391,14 @@ public class WebSession {
                 c.setInstanceFollowRedirects(false);
                 c.setConnectTimeout(15000); c.setReadTimeout(30000);
                 c.setRequestProperty("User-Agent", curUa);
-                c.setRequestProperty("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8");
+                c.setRequestProperty("Accept", "image/png,image/jpeg,image/webp,image/*,*/*;q=0.8");
                 String ck = cm.getCookie(cur);
                 if (ck != null && !ck.isEmpty()) c.setRequestProperty("Cookie", ck);
                 c.setRequestProperty("Referer", "https://" + site.host + "/");
                 int code = c.getResponseCode();
-                List<String> sc = c.getHeaderFields().get("Set-Cookie");
-                if (sc != null) for (String v : sc) cm.setCookie(cur, v);
+                for (Map.Entry<String, List<String>> en : c.getHeaderFields().entrySet()) {
+                    if ("set-cookie".equalsIgnoreCase(en.getKey()) && en.getValue() != null) for (String v : en.getValue()) cm.setCookie(cur, v);
+                }
                 if (code >= 300 && code < 400) {
                     String loc = c.getHeaderField("Location");
                     c.disconnect();
@@ -390,7 +417,8 @@ public class WebSession {
                     byte[] b = new byte[16384]; int n, tot = 0;
                     while ((n = in.read(b)) > 0) { tot += n; if (tot > 25 * 1024 * 1024) return null; bo.write(b, 0, n); }
                 } finally { c.disconnect(); }
-                return bo.size() > 0 ? writeImage(ct, bo.toByteArray()) : null;
+                String rp = bo.size() > 0 ? writeImage(ct, bo.toByteArray()) : null;
+                return (rp != null && !rp.isEmpty()) ? rp : null;
             }
             return null;
         } catch (Exception e) { return null; }
@@ -457,8 +485,11 @@ public class WebSession {
             }
             if (ready) {
                 idleBad = 0;
+                String tk = site == Site.AISTUDIO ? o.optString("tokens", "") : "";
+                boolean tkCh = !tk.equals(lastTokens);
+                if (tkCh) lastTokens = tk;
                 if (!prefsApplied && !applying) { applyPrefs(guest); next(1500); return; }
-                if (usable && status != ST_READY) setStatus(ST_READY, guest ? "Hazır (misafir)" : "Hazır");
+                if (usable && (status != ST_READY || tkCh)) setStatus(ST_READY, guest ? "Hazır (misafir)" : "Hazır");
                 next(usable ? 4000 : 1000); return;
             }
             // sayfa var ama kutu yok
@@ -477,6 +508,7 @@ public class WebSession {
         final List<String[]> steps = new ArrayList<>();
         if (site.modelPicker && !prefModel.isEmpty()) steps.add(new String[]{"setModel", prefModel});
         if (!prefThinking.isEmpty()) steps.add(new String[]{"setThinking", prefThinking});
+        if (site == Site.AISTUDIO && ((!prefMaxOut.isEmpty() && !"65536".equals(prefMaxOut)) || pendingOutReset)) { steps.add(new String[]{"setOutput", prefMaxOut}); pendingOutReset = false; }
         runSteps(steps, 0, guest);
     }
 
@@ -492,17 +524,19 @@ public class WebSession {
         }
         String[] st = steps.get(i);
         JSONObject a = new JSONObject();
-        try { if (st[0].equals("setModel")) a.put("name", st[1]); else a.put("level", st[1]); } catch (Exception ignored) {}
-        setStatus(ST_LOADING, st[0].equals("setModel") ? "Model ayarlanıyor…" : "Düşünme düzeyi ayarlanıyor…");
+        try { if (st[0].equals("setModel")) a.put("name", st[1]); else if (st[0].equals("setOutput")) a.put("value", st[1]); else a.put("level", st[1]); } catch (Exception ignored) {}
+        setStatus(ST_LOADING, st[0].equals("setModel") ? "Model ayarlanıyor…" : st[0].equals("setOutput") ? "Output ayarlanıyor…" : "Düşünme düzeyi ayarlanıyor…");
         final String what = st[0];
         op(what, a, new OpCb() { @Override public void done(JSONObject r) {
             if (!r.optBoolean("ok") && lis != null)
-                lis.onNote((what.equals("setModel") ? "Model" : "Düşünme düzeyi") + " ayarlanamadı (" + r.optString("err") + "). Web sekmesinden elle seçebilirsin.");
+                lis.onNote((what.equals("setModel") ? "Model" : what.equals("setOutput") ? "Output uzunluğu" : "Düşünme düzeyi") + " ayarlanamadı (" + r.optString("err") + "). Web sekmesinden elle seçebilirsin.");
             runSteps(steps, i + 1, guest);
         } });
     }
 
     /** Tercih değişince açık sayfaya hemen uygula. */
+    public void resetOutput() { pendingOutReset = true; reapplyPrefs(); }
+
     public void reapplyPrefs() {
         if (web == null || !usable) return;
         prefsApplied = false; applying = false; usable = false;
@@ -574,7 +608,7 @@ public class WebSession {
 
     private void track(int m0, String base) {
         trackM0 = m0; baseSig = base == null ? "" : base; sawGen = false; errCount = 0;
-        sig = ""; lastText = ""; lastImgs = new ArrayList<>(); stable = 0; tracking = true; noReplyReported = false; dbg = "";
+        sig = ""; lastText = ""; lastTh = ""; lastThOn = false; lastImgs = new ArrayList<>(); stable = 0; tracking = true; noReplyReported = false; dbg = "";
         trackStart = System.currentTimeMillis();
         next(500);
     }
@@ -597,7 +631,7 @@ public class WebSession {
     public void recover() {
         if (web == null) { if (lis != null) lis.onReplyError("Web bağlantısı yok."); return; }
         trackM0 = -1; baseSig = ""; sawGen = true; errCount = 0;
-        sig = ""; lastText = ""; lastImgs = new ArrayList<>(); tracking = true; trackStart = System.currentTimeMillis();
+        sig = ""; lastText = ""; lastTh = ""; lastThOn = false; lastImgs = new ArrayList<>(); tracking = true; trackStart = System.currentTimeMillis();
         finish();
     }
 
@@ -622,13 +656,24 @@ public class WebSession {
             if (o == null || o.optBoolean("noagent")) { if (o != null) inject(); next(900); return; }
             if (o.has("err") && ++errCount == 4 && lis != null) lis.onNote("Sürücü hatası: " + o.optString("err"));
             dbg = o.optString("dbg", dbg);
+            String tk = site == Site.AISTUDIO ? o.optString("tokens", "") : "";
+            if (!tk.equals(lastTokens)) { lastTokens = tk; setStatus(status, info); }
             boolean gen = o.optBoolean("gen");
             if (gen) sawGen = true;
+            if (o.has("th") || o.has("thOn")) {
+                String th = o.has("th") ? o.optString("th", "") : lastTh;
+                boolean thOn = o.optBoolean("thOn");
+                if (!th.equals(lastTh) || thOn != lastThOn) {
+                    lastTh = th; lastThOn = thOn;
+                    if (lis != null) lis.onThinking(th, thOn);
+                }
+            }
             boolean fresh = o.optBoolean("fresh");
             boolean changed = false;
             if (fresh && o.has("text")) {
                 String t = o.optString("text", "");
-                if (!t.equals(lastText)) { lastText = t; changed = true; }
+                boolean lostCode = lastText.contains("```") && (!t.contains("```") || t.contains("Previewing generated HTML")) && t.length() + 120 < lastText.length();
+                if (!lostCode && !t.equals(lastText)) { lastText = t; changed = true; }
                 sig = o.optString("sig", sig);
                 JSONArray im = o.optJSONArray("imgs");
                 if (im != null) { List<String> n = toList(im); if (!n.equals(lastImgs)) { lastImgs = n; changed = true; } }
@@ -637,14 +682,16 @@ public class WebSession {
             if (changed && haveReply && lis != null) lis.onReply(lastText, false);
             if (gen || changed) stable = 0; else stable++;
 
-            if (haveReply && !gen && stable >= 5) { finish(); return; }
+            int needStable = sawGen ? 2 : 4;
+            if (haveReply && !gen && stable >= needStable) { finish(); return; }
             if (!haveReply && !gen && age > 120000) {
                 tracking = false;
                 if (lis != null) lis.onReplyError("Cevap algılanamadı (" + dbg + ").");
                 next(1500); return;
             }
             if (age > 25 * 60 * 1000) { finish(); return; }
-            next(600);
+            long delay = !gen && haveReply ? 400 : lastText.length() > 8000 ? 1200 : lastText.length() > 3000 ? 900 : 600;
+            next(delay);
         } });
     }
 
@@ -653,11 +700,22 @@ public class WebSession {
         agent(stateCall(""), new JCb() { @Override public void got(JSONObject o) {
             if (o != null && o.optBoolean("fresh") && o.has("text")) {
                 String t = o.optString("text", "");
-                if (lastText.isEmpty() || t.length() >= lastText.length()) lastText = t;
+                boolean lostCode = lastText.contains("```") && (!t.contains("```") || t.contains("Previewing generated HTML"));
+                if (!lostCode && (lastText.isEmpty() || t.length() >= lastText.length())) lastText = t;
                 JSONArray im = o.optJSONArray("imgs");
                 if (im != null && im.length() >= lastImgs.size()) lastImgs = toList(im);
             }
-            if (o != null) dbg = o.optString("dbg", dbg);
+            if (o != null) {
+                dbg = o.optString("dbg", dbg);
+                if (site == Site.AISTUDIO) {
+                    String tk = o.optString("tokens", "");
+                    if (!tk.equals(lastTokens)) { lastTokens = tk; setStatus(status, info); }
+                }
+            }
+            if (o != null && o.has("th")) {
+                String th = o.optString("th", "");
+                if (!th.equals(lastTh) || lastThOn) { lastTh = th; lastThOn = false; if (lis != null) lis.onThinking(th, false); }
+            } else if (lastThOn) { lastThOn = false; if (lis != null) lis.onThinking(lastTh, false); }
             complete();
         } });
     }

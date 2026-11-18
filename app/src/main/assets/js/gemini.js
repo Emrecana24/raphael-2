@@ -12,10 +12,14 @@ var isGen = function () {
   if (firstVis(CFG.stop)) return true;
   var r = lastResp();
   if (!r) return false;
-  if (QA('generated-image img, single-image img', r).some(function (im) {
-    return !!(im.currentSrc || im.src) && !im.complete;
+  if (Q('.image-gen-shimmer-placeholder.gem-shimmer-active', r)) return true;
+  var all = [];
+  collectImgs(r, all);
+  all.forEach(function (im) { if (im.loading === 'lazy') im.loading = 'eager'; });
+  if (all.some(function (im) {
+    return inGenBox(im, r) && !!(im.currentSrc || im.src) && !im.complete;
   })) return true;
-  if (Q('generated-image, single-image', r) && !imgsIn(r).length && !Q('message-actions, .response-footer.complete', r)) return true;
+  if (Q('generated-image, single-image, response-image, ucs-generated-image', r) && !imgsIn(r).length && !Q('message-actions, .response-footer.complete', r)) return true;
   return false;
 };
 var lastResp = function () { var r = QA('model-response'); return r.length ? r[r.length - 1] : null; };
@@ -108,6 +112,11 @@ window.__rph = {
     try {
       var m = modelCount(); o.m = m; o.gen = isGen();
       var sn = snap(); o.dbg = 'm=' + m + ' len=' + sn.rawLen + ' img=' + sn.imgs.length;
+      if (!sn.imgs.length && !sn.rawLen) {
+        var sc = lastResp(), di = [];
+        if (sc) collectImgs(sc, di);
+        if (di.length) { var d0 = di[0]; o.dbg += ' c=' + di.length + ':' + (d0.naturalWidth || 0) + 'x' + (d0.naturalHeight || 0) + ' th=' + (inTh(d0, sc) ? 1 : 0) + ' gb=' + (inGenBox(d0, sc) ? 1 : 0); }
+      }
       o.fresh = m0 < 0 || m > m0 || (!!sawGen && sn.cur !== base);
       if (!o.fresh) return o;
       o.sig = sn.cur;

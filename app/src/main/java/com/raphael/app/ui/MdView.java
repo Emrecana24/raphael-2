@@ -16,10 +16,12 @@ import android.text.style.TypefaceSpan;
 import android.text.style.URLSpan;
 import android.text.util.Linkify;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
 import android.widget.TableLayout;
+import android.widget.ScrollView;
 import android.widget.TableRow;
 import android.widget.TextView;
 
@@ -34,6 +36,7 @@ import java.util.regex.Pattern;
  */
 public class MdView extends LinearLayout {
     public interface Copier { void copy(String text, String what); }
+    public interface Saver { void saveCode(String text, String lang); }
 
     private static final int PARA = 0, HEAD = 1, LIST = 2, QUOTE = 3, CODE = 4, TABLE = 5, HR = 6;
 
@@ -47,7 +50,7 @@ public class MdView extends LinearLayout {
         }
     }
 
-    private static class CodeHolder { TextView code, lang, copy; String text = ""; }
+    private static class CodeHolder { TextView code, lang, copy, save; ScrollView vs; String text = ""; }
 
     private final Handler h = new Handler(Looper.getMainLooper());
     private List<Block> cur = new ArrayList<>();
@@ -55,6 +58,7 @@ public class MdView extends LinearLayout {
     private Typeface face = Typeface.SERIF;
     private int color = Ui.TEXT;
     private Copier copier;
+    private Saver saver;
 
     public MdView(Context c) {
         super(c);
@@ -63,6 +67,7 @@ public class MdView extends LinearLayout {
 
     public void setStyle(float sp, Typeface face, int color) { this.sp = sp; this.face = face; this.color = color; }
     public void setCopier(Copier c) { copier = c; }
+    public void setSaver(Saver s) { saver = s; }
 
     public void setMarkdown(String md) {
         List<Block> nb = parse(md == null ? "" : md);
@@ -236,8 +241,12 @@ public class MdView extends LinearLayout {
             case HEAD: ((TextView) v).setText(rich(b)); return true;
             case QUOTE: ((TextView) ((LinearLayout) v).getChildAt(1)).setText(rich(b)); return true;
             case CODE: {
-                CodeHolder ch = (CodeHolder) v.getTag();
+                final CodeHolder ch = (CodeHolder) v.getTag();
+                boolean atBot = ch.vs != null && (ch.vs.getChildCount() == 0 || ch.vs.getChildAt(0).getHeight() - (ch.vs.getHeight() + ch.vs.getScrollY()) < Ui.dp(60));
                 ch.text = b.text; ch.code.setText(b.text); ch.lang.setText(b.lang.isEmpty() ? "kod" : b.lang);
+                if (b.open && ch.vs != null && atBot) {
+                    ch.vs.post(() -> { if (ch.vs.getChildCount() > 0) ch.vs.scrollTo(0, Math.max(0, ch.vs.getChildAt(0).getHeight() - ch.vs.getHeight())); });
+                }
                 return true;
             }
             default: return false;
@@ -292,6 +301,13 @@ public class MdView extends LinearLayout {
         ch.lang.setTextSize(Ui.sp(11)); ch.lang.setTextColor(Ui.MUTED); ch.lang.setTypeface(Typeface.MONOSPACE);
         ch.lang.setText(b.lang.isEmpty() ? "kod" : b.lang);
         head.addView(ch.lang, new LayoutParams(0, -2, 1f));
+        ch.save = new TextView(c);
+        ch.save.setTextSize(Ui.sp(11.5f)); ch.save.setTextColor(Ui.TEXT);
+        ch.save.setText("İndir");
+        ch.save.setPadding(Ui.dp(10), Ui.dp(9), Ui.dp(10), Ui.dp(9));
+        ch.save.setBackground(Ui.ripple(null));
+        ch.save.setOnClickListener(v -> { if (saver != null) saver.saveCode(ch.text, ch.lang.getText().toString()); });
+        head.addView(ch.save, new LayoutParams(-2, -2));
         ch.copy = new TextView(c);
         ch.copy.setTextSize(Ui.sp(11.5f)); ch.copy.setTextColor(Ui.TEXT);
         ch.copy.setText("Kopyala");
@@ -316,7 +332,24 @@ public class MdView extends LinearLayout {
         ch.code.setText(b.text);
         ch.code.setPadding(Ui.dp(12), Ui.dp(2), Ui.dp(12), Ui.dp(12));
         hs.addView(ch.code, new LayoutParams(-2, -2));
-        box.addView(hs, new LayoutParams(-1, -2));
+        ch.vs = new ScrollView(c) {
+            @Override protected void onMeasure(int wSpec, int hSpec) {
+                int max = Ui.dp(260);
+                if (MeasureSpec.getMode(hSpec) == MeasureSpec.UNSPECIFIED || MeasureSpec.getSize(hSpec) > max) {
+                    hSpec = MeasureSpec.makeMeasureSpec(max, MeasureSpec.AT_MOST);
+                }
+                super.onMeasure(wSpec, hSpec);
+            }
+            @Override public boolean dispatchTouchEvent(MotionEvent ev) {
+                if (ev.getActionMasked() == MotionEvent.ACTION_DOWN && getChildCount() > 0 && getChildAt(0).getHeight() > getHeight()) {
+                    requestDisallowInterceptTouchEvent(true);
+                }
+                return super.dispatchTouchEvent(ev);
+            }
+        };
+        ch.vs.setOverScrollMode(OVER_SCROLL_NEVER);
+        ch.vs.addView(hs, new android.widget.FrameLayout.LayoutParams(-1, -2));
+        box.addView(ch.vs, new LayoutParams(-1, -2));
         box.setTag(ch);
         return box;
     }

@@ -1,6 +1,14 @@
 package com.raphael.app;
 
+import android.Manifest;
 import android.app.Activity;
+import android.content.ContentValues;
+import android.content.pm.PackageManager;
+import android.media.MediaScannerConnection;
+import android.os.Build;
+import android.os.Environment;
+import android.provider.MediaStore;
+import java.io.OutputStream;
 import android.app.AlertDialog;
 import android.app.Dialog;
 import android.content.ClipData;
@@ -59,7 +67,7 @@ import java.util.Calendar;
 import java.util.List;
 
 public class MainActivity extends Activity implements WebSession.Listener {
-    private static final int REQ_PICK = 11, REQ_WEBFILE = 12;
+    private static final int REQ_PICK = 11, REQ_WEBFILE = 12, REQ_SAVE_PERM = 13;
     private static final String[] LEVELS = {"", "low", "medium", "high", "xhigh"};
     private static final String[] LEVEL_LABELS = {"Varsayılan", "Low", "Medium", "High", "Extra High"};
 
@@ -84,10 +92,14 @@ public class MainActivity extends Activity implements WebSession.Listener {
     }
     private final List<Att> atts = new ArrayList<>();
     private Att activeUpload = null;
+    private int uploadGen = 0;
     private List<String> pendingImgs = new ArrayList<>();
     private String stage = "", lastPayload = "";
     private List<WebSession.Upload> lastUps = new ArrayList<>();
     private ValueCallback<Uri[]> webFileCb;
+    private File pendingSaveFile;
+    private byte[] pendingSaveBytes;
+    private String pendingSaveName, pendingSaveMime;
     private View lastErrView;
 
     // görünümler
@@ -106,6 +118,9 @@ public class MainActivity extends Activity implements WebSession.Listener {
     private MdView curMd;
     private TextView curFoot;
     private String curText = "";
+    private LinearLayout curThWrap;
+    private TextView curThHdr, curThBody;
+    private boolean curThActive = false, curThOpen = false;
 
     @Override
     protected void onCreate(Bundle b) {
@@ -372,18 +387,18 @@ public class MainActivity extends Activity implements WebSession.Listener {
         webSiteBtn.setOnClickListener(v -> setSite(site == Site.GEMINI ? Site.AISTUDIO : Site.GEMINI));
         row.addView(webSiteBtn, wl());
         TextView reload = Ui.pill(this, "Yenile", 11.5f, Ui.TEXT, Ui.BUBBLE, 0);
-        reload.setOnClickListener(v -> session.reload());
+        reload.setOnClickListener(v -> { session.reload(); invalidateUploads(true); });
         row.addView(reload, wl());
         TextView acct = Ui.pill(this, "Hesap girişi", 11.5f, Ui.TEXT, Ui.BUBBLE, 0);
-        acct.setOnClickListener(v -> { if (!session.isConnected()) session.open(site, site.newChatUrl); session.loginPage(); });
+        acct.setOnClickListener(v -> { invalidateUploads(false); if (!session.isConnected()) session.open(site, site.newChatUrl); session.loginPage(); });
         row.addView(acct, wl());
         webDisplayBtn = Ui.pill(this, "", 11.5f, Ui.TEXT, Ui.BUBBLE, 0);
         webDisplayBtn.setOnClickListener(v -> { prefs.edit().putBoolean("bg", !prefs.getBoolean("bg", true)).apply(); applyBgRender(); });
         row.addView(webDisplayBtn, wl());
         webConnBtn = Ui.pill(this, "Bağlantıyı kes", 11.5f, Ui.TEXT, Ui.BUBBLE, 0);
         webConnBtn.setOnClickListener(v -> {
-            if (session.isConnected()) { session.disconnect(); boundChatId = null; }
-            else session.open(site, site.newChatUrl);
+            if (session.isConnected()) { session.disconnect(); boundChatId = null; invalidateUploads(false); }
+            else { session.open(site, site.newChatUrl); invalidateUploads(true); }
             updateWebBar();
         });
         row.addView(webConnBtn, wl());
@@ -510,12 +525,7 @@ public class MainActivity extends Activity implements WebSession.Listener {
         boolean reloaded = false;
         if (session.isConnected() && !session.isFresh()) { session.newChat(); reloaded = true; }
         else if (!session.isConnected()) { session.open(site, site.newChatUrl); reloaded = true; }
-        if (reloaded && !atts.isEmpty()) {
-            activeUpload = null;
-            for (Att a : atts) if (!a.text) { a.upState = 1; a.tokens = ""; a.wname = ""; a.webIdx = -1; }
-            refreshAttach();
-            pumpPreUpload();
-        }
+        if (reloaded) invalidateUploads(true);
     }
 
     private void openChat(String id) {
@@ -525,6 +535,10 @@ public class MainActivity extends Activity implements WebSession.Listener {
         chat = c;
         boundChatId = null;
         renderChat();
+        if (!atts.isEmpty() && !session.isFresh() && session.isConnected()) {
+            session.open(site, site.newChatUrl);
+            invalidateUploads(true);
+        }
     }
 
     private void renderChat() {
@@ -626,13 +640,187 @@ public class MainActivity extends Activity implements WebSession.Listener {
         FrameLayout.LayoutParams cl = new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.START);
         cl.setMargins(Ui.dp(12), Ui.dp(28), 0, 0);
         box.addView(close, cl);
-        TextView share = Ui.pill(this, "Paylaş / Kaydet", 13, 0xFFFFFFFF, 0x66000000, 0);
+        LinearLayout acts = new LinearLayout(this);
+        TextView save = Ui.pill(this, "Kaydet", 13, 0xFFFFFFFF, 0x66000000, 0);
+        save.setOnClickListener(v -> saveImageToDownloads(f));
+        acts.addView(save, new LinearLayout.LayoutParams(-2, -2));
+        TextView share = Ui.pill(this, "Paylaş", 13, 0xFFFFFFFF, 0x66000000, 0);
         share.setOnClickListener(v -> shareFile("imgs", f.getName()));
+        LinearLayout.LayoutParams shl = new LinearLayout.LayoutParams(-2, -2);
+        shl.leftMargin = Ui.dp(8);
+        acts.addView(share, shl);
         FrameLayout.LayoutParams sl = new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.END);
         sl.setMargins(0, Ui.dp(28), Ui.dp(12), 0);
-        box.addView(share, sl);
+        box.addView(acts, sl);
         d.setContentView(box);
         d.show();
+    }
+
+    private void saveImageToDownloads(final File f) {
+        if (f == null || !f.exists()) { toast("Dosya bulunamadı"); return; }
+        if (Build.VERSION.SDK_INT < 29 && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+            pendingSaveFile = f;
+            requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, REQ_SAVE_PERM);
+            return;
+        }
+        new Thread(() -> {
+            try {
+                String n = f.getName().toLowerCase();
+                String ext = n.endsWith(".jpg") || n.endsWith(".jpeg") ? "jpg" : n.endsWith(".webp") ? "webp" : n.endsWith(".gif") ? "gif" : "png";
+                String mime = ext.equals("jpg") ? "image/jpeg" : ext.equals("webp") ? "image/webp" : ext.equals("gif") ? "image/gif" : "image/png";
+                String ts = new java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US).format(new java.util.Date());
+                String outName = "Raphael_" + ts + "." + ext;
+                if (Build.VERSION.SDK_INT >= 29) {
+                    ContentValues cv = new ContentValues();
+                    cv.put(MediaStore.Downloads.DISPLAY_NAME, outName);
+                    cv.put(MediaStore.Downloads.MIME_TYPE, mime);
+                    cv.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+                    Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv);
+                    if (uri == null) throw new Exception("MediaStore hatası");
+                    try (InputStream in = new java.io.FileInputStream(f); OutputStream os = getContentResolver().openOutputStream(uri)) {
+                        byte[] b = new byte[16384]; int r;
+                        while ((r = in.read(b)) > 0) os.write(b, 0, r);
+                    }
+                } else {
+                    File dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+                    dir.mkdirs();
+                    File out = new File(dir, outName);
+                    int k = 1;
+                    while (out.exists()) { outName = "Raphael_" + ts + "_" + (k++) + "." + ext; out = new File(dir, outName); }
+                    try (InputStream in = new java.io.FileInputStream(f); OutputStream os = new FileOutputStream(out)) {
+                        byte[] b = new byte[16384]; int r;
+                        while ((r = in.read(b)) > 0) os.write(b, 0, r);
+                    }
+                    MediaScannerConnection.scanFile(this, new String[]{out.getAbsolutePath()}, new String[]{mime}, null);
+                }
+                final String fn = outName;
+                runOnUiThread(() -> toast("İndirilenlere kaydedildi: " + fn));
+            } catch (Exception e) {
+                runOnUiThread(() -> toast("Kaydedilemedi: " + e.getMessage()));
+            }
+        }).start();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int req, String[] perms, int[] res) {
+        super.onRequestPermissionsResult(req, perms, res);
+        if (req == REQ_SAVE_PERM) {
+            File f = pendingSaveFile; byte[] d = pendingSaveBytes; String nm = pendingSaveName, mm = pendingSaveMime;
+            pendingSaveFile = null; pendingSaveBytes = null; pendingSaveName = null; pendingSaveMime = null;
+            if (res.length > 0 && res[0] == PackageManager.PERMISSION_GRANTED) {
+                if (f != null) saveImageToDownloads(f);
+                else if (d != null && nm != null) saveBytesToDownloads(d, nm, mm);
+            } else toast("İzin verilmediği için kaydedilemedi");
+        }
+    }
+
+    private String extForLang(String lang) {
+        String l = lang == null ? "" : lang.trim().toLowerCase(java.util.Locale.US);
+        switch (l) {
+            case "python": case "py": return "py";
+            case "javascript": case "js": return "js";
+            case "typescript": case "ts": return "ts";
+            case "html": case "htm": return "html";
+            case "markdown": case "md": return "md";
+            case "kotlin": case "kt": return "kt";
+            case "bash": case "sh": case "shell": case "zsh": return "sh";
+            case "c++": case "cpp": return "cpp";
+            case "c#": case "csharp": case "cs": return "cs";
+            case "rust": case "rs": return "rs";
+            case "yaml": case "yml": return "yml";
+            case "java": case "json": case "xml": case "css": case "scss": case "sql":
+            case "go": case "php": case "c": case "dart": case "swift": case "txt":
+            case "csv": case "toml": case "ini": case "jsx": case "tsx": case "gradle": return l;
+            default: return "txt";
+        }
+    }
+
+    private void showSaveCodeDialog(final String text, String lang) {
+        final String ext = extForLang(lang);
+        String ts = new java.text.SimpleDateFormat("HHmmss", java.util.Locale.US).format(new java.util.Date());
+        final String def = "kod_" + ts + "." + ext;
+        final Dialog d = new Dialog(this);
+        d.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        LinearLayout wrap = new LinearLayout(this);
+        wrap.setPadding(Ui.dp(20), Ui.dp(16), Ui.dp(20), Ui.dp(16));
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setBackground(Ui.round(Ui.BG, 20, Ui.BORDER, 1));
+        box.setPadding(Ui.dp(18), Ui.dp(16), Ui.dp(18), Ui.dp(16));
+        TextView tt = Ui.text(this, "Kodu kaydet", 16, Ui.TEXT);
+        tt.setTypeface(Typeface.SERIF, Typeface.BOLD);
+        box.addView(tt);
+        TextView sub = Ui.text(this, "Doğrudan telefonun Download klasörüne kaydedilir", 11.5f, Ui.MUTED);
+        LinearLayout.LayoutParams sl = new LinearLayout.LayoutParams(-2, -2); sl.topMargin = Ui.dp(4);
+        box.addView(sub, sl);
+        final EditText ed = new EditText(this);
+        ed.setText(def); ed.setTextSize(Ui.sp(14)); ed.setTextColor(Ui.TEXT);
+        ed.setBackground(Ui.round(Ui.SURFACE, 12, Ui.BORDER, 1));
+        ed.setPadding(Ui.dp(12), Ui.dp(10), Ui.dp(12), Ui.dp(10));
+        ed.setSingleLine(true);
+        int dot = def.lastIndexOf("."); if (dot > 0) ed.setSelection(0, dot);
+        LinearLayout.LayoutParams el = new LinearLayout.LayoutParams(-1, -2); el.topMargin = Ui.dp(12);
+        box.addView(ed, el);
+        LinearLayout row = new LinearLayout(this);
+        row.setGravity(Gravity.END);
+        LinearLayout.LayoutParams rl = new LinearLayout.LayoutParams(-1, -2); rl.topMargin = Ui.dp(14);
+        TextView no = Ui.pill(this, "Vazgeç", 12.5f, Ui.TEXT, Ui.BUBBLE, 0);
+        no.setOnClickListener(v -> d.dismiss());
+        row.addView(no);
+        TextView ok = Ui.pill(this, "İndir", 12.5f, 0xFFFFFFFF, Ui.TEXT, 0);
+        LinearLayout.LayoutParams ol = new LinearLayout.LayoutParams(-2, -2); ol.leftMargin = Ui.dp(8);
+        ok.setOnClickListener(v -> {
+            String nm = ed.getText().toString().replaceAll("[\\\\/:*?\"<>|]", "_").trim();
+            if (nm.isEmpty()) nm = def;
+            if (!nm.contains(".")) nm += "." + ext;
+            d.dismiss();
+            try {
+                String mm = (nm.endsWith(".html") || nm.endsWith(".htm")) ? "text/html" : "text/plain";
+                saveBytesToDownloads(text.getBytes("UTF-8"), nm, mm);
+            } catch (Exception ex) { toast("Kaydedilemedi"); }
+        });
+        row.addView(ok, ol);
+        box.addView(row, rl);
+        wrap.addView(box, new LinearLayout.LayoutParams(-1, -2));
+        d.setContentView(wrap);
+        Window w = d.getWindow();
+        if (w != null) { w.setBackgroundDrawable(new ColorDrawable(0)); w.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT); }
+        d.show();
+    }
+
+    private void saveBytesToDownloads(final byte[] data, final String name, final String mime) {
+        if (Build.VERSION.SDK_INT < 29 && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+            pendingSaveBytes = data; pendingSaveName = name; pendingSaveMime = mime;
+            requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, REQ_SAVE_PERM);
+            return;
+        }
+        new Thread(() -> {
+            try {
+                String outName = name;
+                if (Build.VERSION.SDK_INT >= 29) {
+                    ContentValues cv = new ContentValues();
+                    cv.put(MediaStore.Downloads.DISPLAY_NAME, outName);
+                    cv.put(MediaStore.Downloads.MIME_TYPE, mime);
+                    cv.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+                    Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv);
+                    if (uri == null) throw new Exception("MediaStore hatası");
+                    try (OutputStream os = getContentResolver().openOutputStream(uri)) { os.write(data); }
+                } else {
+                    File dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+                    dir.mkdirs();
+                    File out = new File(dir, outName);
+                    int k = 1, dot = name.lastIndexOf(".");
+                    String base = dot > 0 ? name.substring(0, dot) : name, ep = dot > 0 ? name.substring(dot) : "";
+                    while (out.exists()) { outName = base + "_" + (k++) + ep; out = new File(dir, outName); }
+                    try (OutputStream os = new FileOutputStream(out)) { os.write(data); }
+                    MediaScannerConnection.scanFile(this, new String[]{out.getAbsolutePath()}, new String[]{mime}, null);
+                }
+                final String fn = outName;
+                runOnUiThread(() -> toast("İndirilenlere kaydedildi: " + fn));
+            } catch (Exception e) {
+                runOnUiThread(() -> toast("Kaydedilemedi: " + e.getMessage()));
+            }
+        }).start();
     }
 
     private void shareFile(String sub, String name) {
@@ -670,6 +858,7 @@ public class MainActivity extends Activity implements WebSession.Listener {
         MdView md = new MdView(this);
         md.setStyle(14.5f, Typeface.SERIF, Ui.TEXT);
         md.setCopier((text, what) -> copyText(text, what));
+        md.setSaver((text, lang) -> showSaveCodeDialog(text, lang));
         return md;
     }
 
@@ -740,6 +929,7 @@ public class MainActivity extends Activity implements WebSession.Listener {
     private void doSend() {
         String typed = input.getText().toString().trim();
         if (typed.isEmpty() && atts.isEmpty()) return;
+        if (activeUpload != null) { toast("Dosya işlemi sürüyor, bir saniye bekle…"); return; }
         for (Att a : atts) {
             if (!a.text && a.upState == 1) { toast("Dosya siteye yükleniyor, bitmesini bekle…"); return; }
             if (!a.text && a.upState == 3) { toast("Yüklenemeyen dosya var; çarpıdan kaldır veya dokunup tekrar dene"); return; }
@@ -755,6 +945,7 @@ public class MainActivity extends Activity implements WebSession.Listener {
         for (Att a : atts) {
             if (names.length() > 0) names.append(", ");
             names.append(a.name);
+            if (!a.tokens.isEmpty()) names.append(" (").append(a.tokens).append(")");
             if (a.text) {
                 String f = fenceFor(a.content);
                 full.append("Dosya: ").append(a.name).append('\n').append(f).append('\n').append(a.content).append('\n').append(f).append("\n\n");
@@ -838,8 +1029,32 @@ public class MainActivity extends Activity implements WebSession.Listener {
         stage = "";
         curText = "";
         genStart = System.currentTimeMillis();
+        curThActive = false; curThOpen = false;
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
+        curThWrap = new LinearLayout(this);
+        curThWrap.setOrientation(LinearLayout.VERTICAL);
+        curThWrap.setBackground(Ui.round(Ui.CODEBG, 10, Ui.BORDER, 1));
+        curThWrap.setPadding(Ui.dp(10), Ui.dp(7), Ui.dp(10), Ui.dp(7));
+        curThWrap.setVisibility(View.GONE);
+        LinearLayout.LayoutParams thl = new LinearLayout.LayoutParams(-1, -2);
+        thl.bottomMargin = Ui.dp(8);
+        curThHdr = Ui.text(this, "▸ Düşünüyor…", 11.5f, Ui.MUTED);
+        curThWrap.addView(curThHdr, new LinearLayout.LayoutParams(-1, -2));
+        curThBody = Ui.text(this, "", 12f, Ui.MUTED);
+        curThBody.setLineSpacing(0, 1.25f);
+        curThBody.setPadding(0, Ui.dp(6), 0, 0);
+        curThBody.setVisibility(View.GONE);
+        curThWrap.addView(curThBody, new LinearLayout.LayoutParams(-1, -2));
+        final LinearLayout tw = curThWrap; final TextView th = curThHdr, tb = curThBody;
+        tw.setOnClickListener(v -> {
+            boolean open = tb.getVisibility() != View.VISIBLE;
+            tb.setVisibility(open ? View.VISIBLE : View.GONE);
+            if (tw == curThWrap) curThOpen = open;
+            String ct = th.getText().toString();
+            th.setText((open ? "▾ " : "▸ ") + (ct.length() > 2 ? ct.substring(2) : ct));
+        });
+        col.addView(curThWrap, thl);
         curMd = newMd();
         col.addView(curMd, new LinearLayout.LayoutParams(-1, -2));
         curFoot = Ui.text(this, "Yanıt bekleniyor…", 11.5f, Ui.MUTED);
@@ -857,7 +1072,7 @@ public class MainActivity extends Activity implements WebSession.Listener {
         @Override public void run() {
             if (!generating || curFoot == null) return;
             long s = (System.currentTimeMillis() - genStart) / 1000;
-            String base = !stage.isEmpty() ? stage : awaitingStart ? "Web oturumu hazırlanıyor…" : gotFirstText ? "Yazıyor…" : "Yanıt bekleniyor…";
+            String base = !stage.isEmpty() ? stage : awaitingStart ? "Web oturumu hazırlanıyor…" : gotFirstText ? "Yazıyor…" : curThActive ? "Düşünüyor…" : "Yanıt bekleniyor…";
             curFoot.setText(base + " " + s + " sn");
             h.postDelayed(this, 1000);
         }
@@ -878,8 +1093,11 @@ public class MainActivity extends Activity implements WebSession.Listener {
             if (!am.imgs.isEmpty()) col.addView(imagesRow(am.imgs, false), new LinearLayout.LayoutParams(-1, -2));
             col.addView(doneFooter(md, site.id), footLp());
         }
+        if (curThHdr != null && curThWrap != null && curThWrap.getVisibility() == View.VISIBLE) curThHdr.setText((curThOpen ? "▾ " : "▸ ") + "Düşünce");
+        curThWrap = null; curThHdr = null; curThBody = null; curThActive = false;
         curMd = null; curFoot = null;
         updateSendBtn();
+        pumpPreUpload();
     }
 
     private void failAi(String err) {
@@ -905,9 +1123,12 @@ public class MainActivity extends Activity implements WebSession.Listener {
             if (!curText.isEmpty()) { chat.msgs.add(new Msg(Msg.AI, curText, null, site.id)); store.save(chat); }
             if (actions) { curFoot.setOnClickListener(v -> errorActions()); if (curFoot.getParent() instanceof View) lastErrView = (View) curFoot.getParent(); }
         }
+        if (curThHdr != null && curThWrap != null && curThWrap.getVisibility() == View.VISIBLE) curThHdr.setText((curThOpen ? "▾ " : "▸ ") + "Düşünce");
+        curThWrap = null; curThHdr = null; curThBody = null; curThActive = false;
         curMd = null; curFoot = null;
         updateSendBtn();
         scrollBottom();
+        pumpPreUpload();
     }
 
     private void errorActions() {
@@ -943,7 +1164,8 @@ public class MainActivity extends Activity implements WebSession.Listener {
     // ================================================================== WebSession.Listener
     @Override public void onStatus(int st, String info) {
         int c = st == WebSession.ST_READY ? Ui.GREEN : st == WebSession.ST_LOADING ? Ui.AMBER : st == WebSession.ST_LOGIN ? Ui.RED : Ui.MUTED;
-        String txt = site.label + " · " + info;
+        String tk = session.tokens();
+        String txt = site.label + " · " + info + (site == Site.AISTUDIO && !tk.isEmpty() ? " · " + tk : "");
         statusDot.setBackground(Ui.round(c, 4, 0, 0));
         statusTv.setText(txt);
         webDot.setBackground(Ui.round(c, 4, 0, 0));
@@ -955,7 +1177,7 @@ public class MainActivity extends Activity implements WebSession.Listener {
         if (curMd == null) return;
         boolean at = isAtBottom();
         curText = md;
-        if (!md.isEmpty()) { gotFirstText = true; stage = ""; }
+        if (!md.isEmpty()) { gotFirstText = true; stage = ""; if (curThHdr != null && curThWrap != null && curThWrap.getVisibility() == View.VISIBLE) curThHdr.setText((curThOpen ? "▾ " : "▸ ") + "Düşünce"); }
         curMd.setMarkdown(md);
         if (done) { finishAi(md); }
         if (at) scrollBottom();
@@ -966,6 +1188,18 @@ public class MainActivity extends Activity implements WebSession.Listener {
     @Override public void onImages(List<String> names) { pendingImgs = new ArrayList<>(names); }
 
     @Override public void onStage(String t) { stage = t == null ? "" : t; }
+
+    @Override public void onThinking(String text, boolean active) {
+        if (curThWrap == null) return;
+        boolean has = text != null && !text.trim().isEmpty();
+        if (!has && !active) return;
+        boolean at = isAtBottom();
+        curThActive = active;
+        curThWrap.setVisibility(View.VISIBLE);
+        if (has) curThBody.setText(text.trim());
+        curThHdr.setText((curThOpen ? "▾ " : "▸ ") + (active && curText.isEmpty() ? "Düşünüyor…" : "Düşünce"));
+        if (at) scrollBottom();
+    }
 
     @Override public boolean onFileChooser(ValueCallback<Uri[]> cb, WebChromeClient.FileChooserParams p) {
         if (webFileCb != null) webFileCb.onReceiveValue(null);
@@ -1010,7 +1244,9 @@ public class MainActivity extends Activity implements WebSession.Listener {
         return (site != Site.AISTUDIO && "xhigh".equals(lv)) ? "" : lv;
     }
 
-    private void pushPrefs() { session.setPrefs(thinking(), site.modelPicker ? prefs.getString("model_" + site.id, "") : ""); }
+    private String maxOutput() { String v = prefs.getString("out_" + site.id, "65536"); return v.isEmpty() ? "65536" : v; }
+
+    private void pushPrefs() { session.setPrefs(thinking(), site.modelPicker ? prefs.getString("model_" + site.id, "") : "", site == Site.AISTUDIO ? maxOutput() : ""); }
 
     private void updateChip() {
         String lv = thinking();
@@ -1029,12 +1265,7 @@ public class MainActivity extends Activity implements WebSession.Listener {
         pushPrefs();
         updateChip();
         session.open(s, s.newChatUrl);
-        if (!atts.isEmpty()) {
-            activeUpload = null;
-            for (Att a : atts) if (!a.text) { a.upState = 1; a.tokens = ""; a.wname = ""; a.webIdx = -1; }
-            refreshAttach();
-            pumpPreUpload();
-        }
+        invalidateUploads(true);
     }
 
     private void setThinking(String lv) {
@@ -1147,6 +1378,30 @@ public class MainActivity extends Activity implements WebSession.Listener {
             LinearLayout.LayoutParams bl = new LinearLayout.LayoutParams(-1, Ui.dp(44));
             bl.topMargin = Ui.dp(8);
             c.addView(mb, bl);
+            String curOut = maxOutput();
+            TextView oh = Ui.text(this, "Output uzunluğu · " + curOut, 11.5f, Ui.MUTED);
+            LinearLayout.LayoutParams olp = new LinearLayout.LayoutParams(-2, -2);
+            olp.topMargin = Ui.dp(18);
+            c.addView(oh, olp);
+            LinearLayout orow = new LinearLayout(this);
+            String[] oVals = {"65536", "262144", "1048576"};
+            String[] oLbls = {"65K", "262K", "1M"};
+            boolean isPre = "65536".equals(curOut) || "262144".equals(curOut) || "1048576".equals(curOut);
+            for (int i = 0; i < 3; i++) {
+                final String ov = oVals[i];
+                boolean sel = ov.equals(curOut);
+                TextView p = Ui.pill(this, oLbls[i], 12.5f, sel ? 0xFFFFFFFF : Ui.TEXT, sel ? Ui.TEXT : Ui.SURFACE, sel ? 0 : Ui.BORDER);
+                p.setOnClickListener(v -> { d.dismiss(); setMaxOutput(ov); });
+                LinearLayout.LayoutParams pl = new LinearLayout.LayoutParams(0, Ui.dp(38), 1f);
+                pl.rightMargin = Ui.dp(6);
+                orow.addView(p, pl);
+            }
+            TextView cp = Ui.pill(this, "Özel", 12.5f, !isPre ? 0xFFFFFFFF : Ui.TEXT, !isPre ? Ui.TEXT : Ui.SURFACE, !isPre ? 0 : Ui.BORDER);
+            cp.setOnClickListener(v -> { d.dismiss(); askMaxOutput(); });
+            orow.addView(cp, new LinearLayout.LayoutParams(0, Ui.dp(38), 1f));
+            LinearLayout.LayoutParams orl = new LinearLayout.LayoutParams(-1, -2);
+            orl.topMargin = Ui.dp(8);
+            c.addView(orow, orl);
         } else {
             TextView n = Ui.text(this, "Ücretsiz Gemini'de model sabit (Auto); sadece düşünme düzeyi seçilebilir.", 10.5f, Ui.MUTED);
             LinearLayout.LayoutParams nl = new LinearLayout.LayoutParams(-2, -2);
@@ -1188,6 +1443,34 @@ public class MainActivity extends Activity implements WebSession.Listener {
         pushPrefs();
         if (session.isConnected()) session.reapplyPrefs();
         toast(name.isEmpty() ? "Model: varsayılan" : "Model: " + name);
+    }
+
+    private void askMaxOutput() {
+        final EditText e = new EditText(this);
+        e.setInputType(InputType.TYPE_CLASS_NUMBER);
+        e.setHint("örn: 65536 - 1048576");
+        e.setText(maxOutput());
+        new AlertDialog.Builder(this).setTitle("Max Output Token").setView(e)
+                .setPositiveButton("Kaydet", (d, w) -> {
+                    String v = e.getText().toString().replaceAll("[^0-9]", "");
+                    if (v.isEmpty()) v = "65536";
+                    else { try { if (Integer.parseInt(v) > 1048576) v = "1048576"; } catch (Exception ex) { v = "1048576"; } }
+                    setMaxOutput(v);
+                })
+                .setNeutralButton("65K", (d, w) -> setMaxOutput("65536"))
+                .setNegativeButton("Vazgeç", null).show();
+    }
+
+    private void setMaxOutput(String v) {
+        if (v == null || v.isEmpty()) v = "65536";
+        String prev = maxOutput();
+        prefs.edit().putString("out_" + site.id, v).apply();
+        pushPrefs();
+        if (session.isConnected()) {
+            if ("65536".equals(v) && !"65536".equals(prev)) session.resetOutput();
+            else session.reapplyPrefs();
+        }
+        toast("Output: " + v + " token");
     }
 
     // ================================================================== ayarlar
@@ -1294,8 +1577,9 @@ public class MainActivity extends Activity implements WebSession.Listener {
         toast("Dosyalar hazırlanıyor…");
         final List<Uri> fu = uris;
         new Thread(() -> {
-            for (Uri u : fu) readAttachment(u);
-            runOnUiThread(() -> { refreshAttach(); pumpPreUpload(); });
+            final List<Att> added = new ArrayList<>();
+            for (Uri u : fu) { Att a = readAttachment(u); if (a != null) added.add(a); }
+            runOnUiThread(() -> { atts.addAll(added); refreshAttach(); pumpPreUpload(); });
         }).start();
     }
 
@@ -1337,7 +1621,7 @@ public class MainActivity extends Activity implements WebSession.Listener {
     }
 
     /** Arka plan iş parçacığında çalışır: dosyayı önbelleğe kopyalar, metin mi ikili mi karar verir. */
-    private void readAttachment(Uri u) {
+    private Att readAttachment(Uri u) {
         String name = "dosya";
         try (Cursor c = getContentResolver().query(u, null, null, null, null)) {
             if (c != null && c.moveToFirst()) {
@@ -1358,10 +1642,10 @@ public class MainActivity extends Activity implements WebSession.Listener {
             int n;
             while ((n = in.read(b)) > 0) {
                 total += n;
-                if (total > 30L * 1024 * 1024) { f.delete(); runOnUiThread(() -> toast(fname + " çok büyük (en fazla 30 MB). Büyük dosyayı Web sekmesinden yükle.")); return; }
+                if (total > 30L * 1024 * 1024) { f.delete(); runOnUiThread(() -> toast(fname + " çok büyük (en fazla 30 MB). Büyük dosyayı Web sekmesinden yükle.")); return null; }
                 out.write(b, 0, n);
             }
-        } catch (Exception e) { f.delete(); runOnUiThread(() -> toast("Okunamadı: " + fname)); return; }
+        } catch (Exception e) { f.delete(); runOnUiThread(() -> toast("Okunamadı: " + fname)); return null; }
 
         Att a = new Att();
         a.id = id; a.name = name; a.mime = mime; a.size = total; a.file = f;
@@ -1390,10 +1674,26 @@ public class MainActivity extends Activity implements WebSession.Listener {
             } catch (Exception ignored) {}
         }
         if (!a.text) a.upState = 1;
-        synchronized (atts) { atts.add(a); }
+        return a;
     }
 
     private String sizeStr(long b) { return b >= 1024 * 1024 ? String.format(java.util.Locale.US, "%.1f MB", b / 1048576f) : Math.max(1, b / 1024) + " KB"; }
+
+    private void invalidateUploads(boolean restart) {
+        uploadGen++;
+        activeUpload = null;
+        boolean any = false;
+        for (Att a : atts) {
+            if (!a.text && !a.removed) {
+                a.upState = 1; a.tokens = ""; a.wname = ""; a.webIdx = -1;
+                any = true;
+            }
+        }
+        if (any) {
+            refreshAttach();
+            if (restart) pumpPreUpload();
+        }
+    }
 
     private void pumpPreUpload() {
         if (activeUpload != null || generating) return;
@@ -1402,23 +1702,33 @@ public class MainActivity extends Activity implements WebSession.Listener {
             if (!a.text && !a.removed && a.upState == 1) { next = a; break; }
         }
         if (next == null) return;
-        final Att cur = next;
-        final Site upSite = site;
-        activeUpload = cur;
         if (!chat.id.equals(boundChatId) && !session.isFresh() && session.isConnected()) {
+            invalidateUploads(false);
             session.open(site, site.newChatUrl);
         }
+        final Att cur = next;
+        final Site upSite = site;
+        final int gen = uploadGen;
+        activeUpload = cur;
         session.whenUsable(() -> {
-            if (site != upSite || cur.removed || !atts.contains(cur)) {
-                if (activeUpload == cur) activeUpload = null;
-                pumpPreUpload();
+            if (gen != uploadGen || site != upSite || cur.removed || !atts.contains(cur)) {
+                if (gen == uploadGen && activeUpload == cur) {
+                    activeUpload = null;
+                    if (cur.removed && cur.file != null) cur.file.delete();
+                    pumpPreUpload();
+                }
                 return;
             }
             session.attachOne(new WebSession.Upload(cur.id, cur.name, cur.mime, cur.file), (ok, tokens, wname, idx, err) -> {
+                if (gen != uploadGen) {
+                    if (cur.removed && cur.file != null) cur.file.delete();
+                    return;
+                }
                 if (activeUpload == cur) activeUpload = null;
                 if (site != upSite) { pumpPreUpload(); return; }
                 if (cur.removed || !atts.contains(cur)) {
-                    if (ok) session.removeAttached(cur.name, wname, idx);
+                    if (ok) session.removeAttached(cur.name, (wname != null && !wname.isEmpty()) ? wname : cur.wname, idx);
+                    if (cur.file != null) cur.file.delete();
                     pumpPreUpload();
                     return;
                 }
@@ -1470,6 +1780,7 @@ public class MainActivity extends Activity implements WebSession.Listener {
             ImageView x = Ui.icon(this, R.drawable.ic_close, 22, Ui.MUTED);
             x.setPadding(Ui.dp(4), Ui.dp(4), Ui.dp(4), Ui.dp(4));
             x.setOnClickListener(v -> {
+                boolean busy = (a == activeUpload);
                 a.removed = true;
                 int ridx = a.webIdx;
                 boolean wasUp = a.upState == 2;
@@ -1478,7 +1789,7 @@ public class MainActivity extends Activity implements WebSession.Listener {
                     for (Att o : atts) if (!o.text && o.upState == 2 && ridx >= 0 && o.webIdx > ridx) o.webIdx--;
                     session.removeAttached(a.name, a.wname, ridx);
                 }
-                if (a.file != null) a.file.delete();
+                if (!busy && a.file != null) a.file.delete();
                 if (a.thumb != null) store.img(a.thumb).delete();
                 refreshAttach();
             });
@@ -1506,7 +1817,10 @@ public class MainActivity extends Activity implements WebSession.Listener {
     }
 
     private void scrollBottom() {
-        scroll.post(() -> scroll.smoothScrollTo(0, messages.getBottom() + Ui.dp(40)));
+        scroll.post(() -> {
+            View c = scroll.getChildAt(0);
+            if (c != null) scroll.scrollTo(0, Math.max(0, c.getHeight() - scroll.getHeight()));
+        });
     }
 
     private void copyText(String text, String msg) {
