@@ -82,9 +82,9 @@ public class WebSession {
     private int status = ST_OFF;
     private String info = "";
     private boolean usable = false, fresh = false, prefsApplied = false, applying = false;
-    private boolean destroyed = false, pendingOutReset = false;
-    private int readyTries = 0, uaMode = 0;
-    private String prefThinking = "", prefModel = "", prefMaxOut = "", lastTokens = "";
+    private boolean destroyed = false, pendingOutReset = false, sysPending = false;
+    private int readyTries = 0, uaMode = 0, pageGen = 0, lastW = 0, lastH = 0;
+    private String prefThinking = "", prefModel = "", prefMaxOut = "", prefSys = "", lastTokens = "";
     private final Map<String, String> scriptCache = new HashMap<>();
     private final List<Runnable> queue = new ArrayList<>();
     private final Map<String, OpCb> ops = new HashMap<>();
@@ -121,14 +121,27 @@ public class WebSession {
     public void setUaMode(int m) { uaMode = m; }
     public void markUsed() { fresh = false; }
 
-    public void attach(FrameLayout host) { this.host = host; }
+    public void attach(FrameLayout host) {
+        this.host = host;
+        if (web != null && host != null) {
+            if (web.getParent() instanceof android.view.ViewGroup) ((android.view.ViewGroup) web.getParent()).removeView(web);
+            host.addView(web, new FrameLayout.LayoutParams(-1, -1));
+        }
+    }
+    public void detach(FrameLayout oldHost) {
+        if (this.host == oldHost) this.host = null;
+        if (web != null && web.getParent() == oldHost) {
+            int w = oldHost.getWidth(), hh = oldHost.getHeight(); oldHost.removeView(web);
+            if (w > 0 && hh > 0) { lastW = w; lastH = hh; web.measure(android.view.View.MeasureSpec.makeMeasureSpec(w, android.view.View.MeasureSpec.EXACTLY), android.view.View.MeasureSpec.makeMeasureSpec(hh, android.view.View.MeasureSpec.EXACTLY)); web.layout(0, 0, w, hh); }
+        }
+    }
 
     public void setPrefs(String thinking, String model, String maxOut) { prefThinking = thinking == null ? "" : thinking; prefModel = model == null ? "" : model; prefMaxOut = maxOut == null ? "" : maxOut; }
 
     // ------------------------------------------------------------------ WebView
     @SuppressWarnings("SetJavaScriptEnabled")
     private void ensureWeb() {
-        if (web != null || host == null) return;
+        if (web != null) return;
         web = new WebView(ctx);
         WebSettings s = web.getSettings();
         s.setJavaScriptEnabled(true);
@@ -158,7 +171,7 @@ public class WebSession {
         });
         web.setWebViewClient(new WebViewClient() {
             @Override public void onPageStarted(WebView v, String url, Bitmap fav) {
-                usable = false; prefsApplied = false; applying = false;
+                pageGen++; usable = false; prefsApplied = false; applying = false;
                 setStatus(ST_LOADING, "Yükleniyor…");
             }
             @Override public void onPageFinished(WebView v, String url) {
@@ -176,7 +189,13 @@ public class WebSession {
                 if (r.isForMainFrame()) { setStatus(ST_OFF, "Bağlantı hatası"); }
             }
         });
-        host.addView(web, new FrameLayout.LayoutParams(-1, -1));
+        if (host != null) host.addView(web, new FrameLayout.LayoutParams(-1, -1));
+        else {
+            int w = lastW > 0 ? lastW : ctx.getResources().getDisplayMetrics().widthPixels;
+            int hh = lastH > 0 ? lastH : ctx.getResources().getDisplayMetrics().heightPixels;
+            web.measure(android.view.View.MeasureSpec.makeMeasureSpec(w, android.view.View.MeasureSpec.EXACTLY), android.view.View.MeasureSpec.makeMeasureSpec(hh, android.view.View.MeasureSpec.EXACTLY));
+            web.layout(0, 0, w, hh);
+        }
     }
 
     private String chromeVer() {
@@ -210,6 +229,7 @@ public class WebSession {
         site = s;
         ensureWeb();
         if (web == null) return;
+        pageGen++; applying = false;
         stopTracking();
         queue.clear();
         lastTokens = "";
@@ -226,6 +246,7 @@ public class WebSession {
     public void loginPage() {
         ensureWeb();
         if (web == null) return;
+        pageGen++; applying = false;
         queue.clear();
         lastTokens = "";
         clearOps("giris-sayfasi");
@@ -239,13 +260,14 @@ public class WebSession {
     public void disconnect() {
         stopTracking();
         h.removeCallbacks(tickR);
+        pageGen++; applying = false;
         usable = false; fresh = false;
         queue.clear();
         lastTokens = "";
         clearOps("baglanti-kesildi");
         if (web != null) {
             try { web.loadUrl("about:blank"); web.stopLoading(); } catch (Throwable ignored) {}
-            if (host != null) host.removeView(web);
+            if (web.getParent() instanceof android.view.ViewGroup) ((android.view.ViewGroup) web.getParent()).removeView(web);
             try { web.removeAllViews(); web.destroy(); } catch (Throwable ignored) {}
             web = null;
         }
@@ -454,6 +476,11 @@ public class WebSession {
         } }, 120000);
     }
 
+    public void fetchImages(final List<String> urls, final ImgCb cb) {
+        if (urls == null || urls.isEmpty()) { cb.done(new ArrayList<String>()); return; }
+        grabImages(urls, cb);
+    }
+
     public void saveDom() {
         try { op("dom", new JSONObject().put("site", site.id), new OpCb() { @Override public void done(JSONObject r) {
             if (!r.optBoolean("ok") && lis != null) lis.onNote("DOM alınamadı: " + r.optString("err")); } }); } catch (Exception ignored) {}
@@ -505,15 +532,17 @@ public class WebSession {
     /** Kullanıcı tercihlerini (model, düşünme düzeyi) siteye uygular, sonra kuyruğu çalıştırır. */
     private void applyPrefs(final boolean guest) {
         applying = true;
+        final int gen = pageGen;
         final List<String[]> steps = new ArrayList<>();
         if (site.modelPicker && !prefModel.isEmpty()) steps.add(new String[]{"setModel", prefModel});
         if (!prefThinking.isEmpty()) steps.add(new String[]{"setThinking", prefThinking});
         if (site == Site.AISTUDIO && ((!prefMaxOut.isEmpty() && !"65536".equals(prefMaxOut)) || pendingOutReset)) { steps.add(new String[]{"setOutput", prefMaxOut}); pendingOutReset = false; }
-        runSteps(steps, 0, guest);
+        if (site == Site.AISTUDIO && (!prefSys.isEmpty() || sysPending)) steps.add(new String[]{"setSystemInstruction", prefSys});
+        runSteps(steps, 0, guest, gen);
     }
 
-    private void runSteps(final List<String[]> steps, final int i, final boolean guest) {
-        if (web == null) return;
+    private void runSteps(final List<String[]> steps, final int i, final boolean guest, final int gen) {
+        if (web == null || gen != pageGen) return;
         if (i >= steps.size()) {
             applying = false; prefsApplied = true; usable = true;
             setStatus(ST_READY, guest ? "Hazır (misafir)" : "Hazır");
@@ -524,21 +553,35 @@ public class WebSession {
         }
         String[] st = steps.get(i);
         JSONObject a = new JSONObject();
-        try { if (st[0].equals("setModel")) a.put("name", st[1]); else if (st[0].equals("setOutput")) a.put("value", st[1]); else a.put("level", st[1]); } catch (Exception ignored) {}
-        setStatus(ST_LOADING, st[0].equals("setModel") ? "Model ayarlanıyor…" : st[0].equals("setOutput") ? "Output ayarlanıyor…" : "Düşünme düzeyi ayarlanıyor…");
+        try { if (st[0].equals("setModel")) a.put("name", st[1]); else if (st[0].equals("setOutput")) a.put("value", st[1]); else if (st[0].equals("setSystemInstruction")) a.put("text", st[1]); else a.put("level", st[1]); } catch (Exception ignored) {}
+        setStatus(ST_LOADING, st[0].equals("setModel") ? "Model ayarlanıyor…" : st[0].equals("setOutput") ? "Output ayarlanıyor…" : st[0].equals("setSystemInstruction") ? "Sistem talimatı ayarlanıyor…" : "Düşünme düzeyi ayarlanıyor…");
         final String what = st[0];
         op(what, a, new OpCb() { @Override public void done(JSONObject r) {
+            if (gen != pageGen) return;
+            if (what.equals("setSystemInstruction") && r.optBoolean("ok")) sysPending = false;
             if (!r.optBoolean("ok") && lis != null)
-                lis.onNote((what.equals("setModel") ? "Model" : what.equals("setOutput") ? "Output uzunluğu" : "Düşünme düzeyi") + " ayarlanamadı (" + r.optString("err") + "). Web sekmesinden elle seçebilirsin.");
-            runSteps(steps, i + 1, guest);
+                lis.onNote((what.equals("setModel") ? "Model" : what.equals("setOutput") ? "Output uzunluğu" : what.equals("setSystemInstruction") ? "Sistem talimatı" : "Düşünme düzeyi") + " ayarlanamadı (" + r.optString("err") + "). Web sekmesinden elle seçebilirsin.");
+            runSteps(steps, i + 1, guest, gen);
         } });
     }
 
     /** Tercih değişince açık sayfaya hemen uygula. */
+    public void setSysPrompt(String sys, boolean pending) { prefSys = sys == null ? "" : sys; sysPending = pending; }
+    public boolean isSysPending() { return sysPending; }
+    public void applySystemInstruction(final String text, final OpCb cb) {
+        prefSys = text == null ? "" : text; sysPending = true;
+        if (site != Site.AISTUDIO || web == null || !usable) {
+            if (cb != null) { JSONObject o = new JSONObject(); try { o.put("ok", false).put("deferred", true); } catch (Exception ignored) {} cb.done(o); }
+            return;
+        }
+        JSONObject a = new JSONObject(); try { a.put("text", prefSys); } catch (Exception ignored) {}
+        op("setSystemInstruction", a, new OpCb() { @Override public void done(JSONObject r) { if (r.optBoolean("ok")) sysPending = false; if (cb != null) cb.done(r); } }, 30000);
+    }
     public void resetOutput() { pendingOutReset = true; reapplyPrefs(); }
 
     public void reapplyPrefs() {
         if (web == null || !usable) return;
+        pageGen++;
         prefsApplied = false; applying = false; usable = false;
         next(100);
     }

@@ -72,6 +72,7 @@ public class ChatStore {
             Chat c = new Chat();
             c.id = o.optString("id", id); c.title = o.optString("title", "Sohbet"); c.site = o.optString("site", "gemini");
             c.created = o.optLong("c"); c.updated = o.optLong("u");
+            c.codeDir = o.optString("cd", ""); c.codeAuto = o.optBoolean("ca", false);
             JSONArray m = o.optJSONArray("m");
             if (m != null) for (int i = 0; i < m.length(); i++) c.msgs.add(Msg.fromJson(m.getJSONObject(i)));
             c.count = c.msgs.size();
@@ -85,6 +86,8 @@ public class ChatStore {
             c.count = c.msgs.size();
             JSONObject o = new JSONObject();
             o.put("id", c.id).put("title", c.title).put("site", c.site).put("c", c.created).put("u", c.updated);
+            if (c.codeDir != null && !c.codeDir.isEmpty()) o.put("cd", c.codeDir);
+            if (c.codeAuto) o.put("ca", true);
             JSONArray m = new JSONArray();
             for (Msg x : c.msgs) m.put(x.toJson());
             o.put("m", m);

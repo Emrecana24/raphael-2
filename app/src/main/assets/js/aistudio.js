@@ -167,6 +167,21 @@ ops.setOutput = async function (a) {
   return { ok: true };
 };
 
+ops.setSystemInstruction = async function (a) {
+  var want = a.text == null ? '' : String(a.text);
+  var r = await openSettings(function () { return firstVis(['ms-system-instructions-panel button.system-instructions-card', 'button[aria-label="System instructions"]']); });
+  if (!r.el) { closeSettings(r); return { ok: false, err: 'sys-buton-yok' }; }
+  press(r.el);
+  var ta = await waitFor(function () { return firstVis(['ms-system-instructions textarea[aria-label="System instructions"]', 'ms-system-instructions textarea', 'mat-dialog-container textarea']); }, 4000);
+  if (!ta) { closeMenus(); closeSettings(r); return { ok: false, err: 'sys-kutu-yok' }; }
+  if ((ta.value || '') !== want) {
+    ta.focus(); setNative(ta, want); await sleep(450);
+    await waitFor(function () { var st = Q('mat-dialog-container .saving-status'); return !st || /saved|kaydedildi/i.test(st.innerText || st.textContent || ''); }, 2500, 150);
+  }
+  var cl = firstVis(['mat-dialog-container button[aria-label="Close panel"]', 'mat-dialog-container button[mattooltip="Close panel"]']);
+  if (cl) press(cl); else closeMenus(); await sleep(300); closeSettings(r); return { ok: true };
+};
+
 window.__rph = {
   ver: VER, site: 'aistudio',
   probe: function () {

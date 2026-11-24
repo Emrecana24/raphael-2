@@ -11,5 +11,7 @@ public class Chat {
     public long created = System.currentTimeMillis();
     public long updated = created;
     public int count = 0; // sadece liste için
+    public String codeDir = "";
+    public boolean codeAuto = false;
     public final List<Msg> msgs = new ArrayList<>();
 }

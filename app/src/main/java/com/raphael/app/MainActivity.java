@@ -47,6 +47,10 @@ import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import com.raphael.app.code.CodeProtocol;
+import com.raphael.app.code.CodeUi;
+import com.raphael.app.code.CodeWorkspace;
+import com.raphael.app.core.AppCore;
 import com.raphael.app.core.Site;
 import com.raphael.app.core.WebSession;
 import com.raphael.app.data.Chat;
@@ -66,41 +70,29 @@ import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.List;
 
-public class MainActivity extends Activity implements WebSession.Listener {
-    private static final int REQ_PICK = 11, REQ_WEBFILE = 12, REQ_SAVE_PERM = 13;
+public class MainActivity extends Activity implements AppCore.UiBridge {
+    private static final int REQ_PICK = 11, REQ_WEBFILE = 12, REQ_SAVE_PERM = 13, REQ_CODE_PERM = 14, REQ_NOTIF_PERM = 15;
     private static final String[] LEVELS = {"", "low", "medium", "high", "xhigh"};
     private static final String[] LEVEL_LABELS = {"Varsayılan", "Low", "Medium", "High", "Extra High"};
 
     private final Handler h = new Handler(Looper.getMainLooper());
     private SharedPreferences prefs;
+    private AppCore core;
     private ChatStore store;
     private WebSession session;
 
-    // durum
-    private Site site = Site.GEMINI;
-    private Chat chat = new Chat();
-    private String boundChatId = null;
-    private Site boundSite = null;
-    private boolean generating = false, awaitingStart = false, webMode = false, gotFirstText = false;
-    private long genStart = 0;
-    private static class Att {
-        String id, name, mime, content, thumb, tokens = "", wname = "";
-        File file;
-        long size;
-        boolean text, removed;
-        int upState = 0, webIdx = -1;
-    }
-    private final List<Att> atts = new ArrayList<>();
-    private Att activeUpload = null;
-    private int uploadGen = 0;
-    private List<String> pendingImgs = new ArrayList<>();
-    private String stage = "", lastPayload = "";
-    private List<WebSession.Upload> lastUps = new ArrayList<>();
+    private boolean webMode = false;
+    private View lastSwitchBanner, lastErrView;
+    private LinearLayout lastAiCol;
     private ValueCallback<Uri[]> webFileCb;
     private File pendingSaveFile;
     private byte[] pendingSaveBytes;
     private String pendingSaveName, pendingSaveMime;
-    private View lastErrView;
+    private Runnable pendingPermR = null;
+    private CodeUi.ModeTabs modeTabs;
+    private CodeUi.CodeBar codeBar;
+    private HorizontalScrollView slashWrap;
+    private LinearLayout slashRow;
 
     // görünümler
     private FrameLayout root, chatArea, webHost;
@@ -117,49 +109,27 @@ public class MainActivity extends Activity implements WebSession.Listener {
     // akış
     private MdView curMd;
     private TextView curFoot;
-    private String curText = "";
     private LinearLayout curThWrap;
     private TextView curThHdr, curThBody;
-    private boolean curThActive = false, curThOpen = false;
+    private boolean curThOpen = false, hasUiText = false;
 
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
         Ui.init(this);
-        prefs = getSharedPreferences("raphael", MODE_PRIVATE);
-        Ui.fontScale = prefs.getFloat("fs", 1f);
-        store = new ChatStore(this);
-        File upd = new File(getCacheDir(), "up");
-        File[] old = upd.listFiles();
-        if (old != null) for (File f : old) f.delete();
-        site = Site.fromId(prefs.getString("site", "gemini"));
+        core = AppCore.get(this); prefs = core.prefs; store = core.store; session = core.session;
         drawerW = Math.min(Ui.dp(300), (int) (getResources().getDisplayMetrics().widthPixels * 0.85f));
-
-        session = new WebSession(this);
-        session.setListener(this);
-        session.setUaMode(prefs.getInt("ua", 0));
-        pushPrefs();
-
-        buildUi();
-        setContentView(root);
-
-        // son sohbeti aç
-        List<Chat> all = store.list();
-        if (!all.isEmpty() && prefs.getBoolean("openLast", true)) {
-            Chat c = store.load(all.get(0).id);
-            if (c != null && !c.msgs.isEmpty()) chat = c;
+        buildUi(); setContentView(root);
+        core.attachUi(this, webHost);
+        renderChat(); refreshCodeUi(); refreshAttach(); updateChip(); applyBgRender();
+        onCoreStatus(core.siteSt, core.siteInfo);
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED && !prefs.getBoolean("askedNotif", false)) {
+            prefs.edit().putBoolean("askedNotif", true).apply();
+            requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, REQ_NOTIF_PERM);
         }
-        renderChat();
-        updateChip();
-        applyBgRender();
-        session.open(site, site.newChatUrl);
     }
-
-    @Override
-    protected void onDestroy() {
-        super.onDestroy();
-        session.destroy();
-    }
+    @Override protected void onResume() { super.onResume(); if (core != null) { updateChip(); refreshCodeUi(); refreshAttach(); updateWebBar(); onCoreStatus(core.siteSt, core.siteInfo); } }
+    @Override protected void onDestroy() { super.onDestroy(); h.removeCallbacks(uiTimerR); if (core != null) core.detachUi(this, webHost); }
 
     @Override
     public void onBackPressed() {
@@ -180,7 +150,6 @@ public class MainActivity extends Activity implements WebSession.Listener {
         webPage.addView(buildWebBar(), new LinearLayout.LayoutParams(-1, Ui.dp(44)));
         webHost = new FrameLayout(this);
         webPage.addView(webHost, new LinearLayout.LayoutParams(-1, 0, 1f));
-        session.attach(webHost);
         root.addView(webPage, new FrameLayout.LayoutParams(-1, -1));
 
         // ---- Sohbet sayfası (üstte, opak)
@@ -189,6 +158,10 @@ public class MainActivity extends Activity implements WebSession.Listener {
         chatPage.setBackgroundColor(Ui.BG);
         chatPage.setClickable(true);
         chatPage.addView(buildTopBar(), new LinearLayout.LayoutParams(-1, Ui.dp(52)));
+        modeTabs = CodeUi.buildModeSwitch(this, v -> { if (core.codeMode) requestExitCodeMode(); }, v -> { if (!core.codeMode) requestEnterCodeMode(null); });
+        chatPage.addView(modeTabs.wrap, new LinearLayout.LayoutParams(-1, -2));
+        codeBar = CodeUi.buildCodeBar(this, codeHost());
+        chatPage.addView(codeBar.root, new LinearLayout.LayoutParams(-1, -2));
 
         chatArea = new FrameLayout(this);
         scroll = new ScrollView(this);
@@ -299,6 +272,9 @@ public class MainActivity extends Activity implements WebSession.Listener {
         card.setPadding(Ui.dp(12), Ui.dp(8), Ui.dp(10), Ui.dp(10));
         card.setElevation(Ui.dp(2));
 
+        slashWrap = new HorizontalScrollView(this); slashWrap.setHorizontalScrollBarEnabled(false); slashWrap.setVisibility(View.GONE);
+        slashRow = new LinearLayout(this); slashRow.setOrientation(LinearLayout.HORIZONTAL); slashWrap.addView(slashRow);
+        card.addView(slashWrap, new LinearLayout.LayoutParams(-1, -2));
         attachRow = new HorizontalScrollView(this);
         attachRow.setHorizontalScrollBarEnabled(false);
         attachRow.setVisibility(View.GONE);
@@ -319,7 +295,7 @@ public class MainActivity extends Activity implements WebSession.Listener {
         input.addTextChangedListener(new TextWatcher() {
             public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
             public void onTextChanged(CharSequence s, int a, int b, int c) {}
-            public void afterTextChanged(Editable e) { updateSendBtn(); }
+            public void afterTextChanged(Editable e) { updateSendBtn(); if (slashWrap != null) CodeUi.updateSlashBar(slashWrap, slashRow, e.toString(), core.codeMode, codeHost()); }
         });
         card.addView(input, new LinearLayout.LayoutParams(-1, -2));
 
@@ -384,22 +360,22 @@ public class MainActivity extends Activity implements WebSession.Listener {
         row.addView(st, new LinearLayout.LayoutParams(-2, -2));
 
         webSiteBtn = Ui.pill(this, "", 11.5f, Ui.TEXT, Ui.BUBBLE, 0);
-        webSiteBtn.setOnClickListener(v -> setSite(site == Site.GEMINI ? Site.AISTUDIO : Site.GEMINI));
+        webSiteBtn.setOnClickListener(v -> setSite(core.site == Site.GEMINI ? Site.AISTUDIO : Site.GEMINI));
         row.addView(webSiteBtn, wl());
         TextView reload = Ui.pill(this, "Yenile", 11.5f, Ui.TEXT, Ui.BUBBLE, 0);
-        reload.setOnClickListener(v -> { session.reload(); invalidateUploads(true); });
+        reload.setOnClickListener(v -> { core.boundChatId = null; core.boundSite = null; session.reload(); core.invalidateUploads(true); core.updateNotif(); });
         row.addView(reload, wl());
         TextView acct = Ui.pill(this, "Hesap girişi", 11.5f, Ui.TEXT, Ui.BUBBLE, 0);
-        acct.setOnClickListener(v -> { invalidateUploads(false); if (!session.isConnected()) session.open(site, site.newChatUrl); session.loginPage(); });
+        acct.setOnClickListener(v -> { core.invalidateUploads(false); if (!session.isConnected()) session.open(core.site, core.site.newChatUrl); session.loginPage(); core.updateNotif(); });
         row.addView(acct, wl());
         webDisplayBtn = Ui.pill(this, "", 11.5f, Ui.TEXT, Ui.BUBBLE, 0);
         webDisplayBtn.setOnClickListener(v -> { prefs.edit().putBoolean("bg", !prefs.getBoolean("bg", true)).apply(); applyBgRender(); });
         row.addView(webDisplayBtn, wl());
         webConnBtn = Ui.pill(this, "Bağlantıyı kes", 11.5f, Ui.TEXT, Ui.BUBBLE, 0);
         webConnBtn.setOnClickListener(v -> {
-            if (session.isConnected()) { session.disconnect(); boundChatId = null; invalidateUploads(false); }
-            else { session.open(site, site.newChatUrl); invalidateUploads(true); }
-            updateWebBar();
+            if (session.isConnected()) { session.disconnect(); core.boundChatId = null; core.boundSite = null; core.invalidateUploads(false); }
+            else { session.open(core.site, core.site.newChatUrl); core.invalidateUploads(true); }
+            core.updateNotif(); updateWebBar();
         });
         row.addView(webConnBtn, wl());
         TextView dom = Ui.pill(this, "DOM kaydet", 11.5f, Ui.TEXT, Ui.BUBBLE, 0);
@@ -438,8 +414,13 @@ public class MainActivity extends Activity implements WebSession.Listener {
         TextView nc = Ui.pill(this, "＋  Yeni sohbet", 13.5f, 0xFFFFFFFF, Ui.TEXT, 0);
         nc.setOnClickListener(v -> { closeDrawer(); newChat(); });
         LinearLayout.LayoutParams nl = new LinearLayout.LayoutParams(-1, -2);
-        nl.topMargin = Ui.dp(18); nl.bottomMargin = Ui.dp(12);
+        nl.topMargin = Ui.dp(18); nl.bottomMargin = Ui.dp(8);
         p.addView(nc, nl);
+        TextView imp = Ui.pill(this, "↓  Web'den sohbet al", 13f, Ui.TEXT, Ui.SURFACE, Ui.BORDER);
+        imp.setOnClickListener(v -> { closeDrawer(); openImportPicker(); });
+        LinearLayout.LayoutParams il = new LinearLayout.LayoutParams(-1, -2);
+        il.bottomMargin = Ui.dp(14);
+        p.addView(imp, il);
 
         p.addView(Ui.text(this, "Sohbetler", 11, Ui.MUTED), new LinearLayout.LayoutParams(-2, -2));
         ScrollView sv = new ScrollView(this);
@@ -461,6 +442,99 @@ public class MainActivity extends Activity implements WebSession.Listener {
     }
 
     // ================================================================== çekmece
+    private void openImportPicker() {
+        if (core.generating) { toast("Önce yanıtın bitmesini bekle ya da durdur"); return; }
+        final Dialog d = new Dialog(this); d.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        LinearLayout wrap = new LinearLayout(this); wrap.setPadding(Ui.dp(20), Ui.dp(16), Ui.dp(20), Ui.dp(16));
+        LinearLayout box = new LinearLayout(this); box.setOrientation(LinearLayout.VERTICAL); box.setBackground(Ui.round(Ui.BG, 22, Ui.BORDER, 1)); box.setPadding(Ui.dp(18), Ui.dp(18), Ui.dp(18), Ui.dp(16));
+        if (core.site != Site.GEMINI) {
+            TextView tt = Ui.text(this, core.site.label + " sohbet çekme", 17, Ui.TEXT); tt.setTypeface(Typeface.SERIF, Typeface.BOLD); box.addView(tt);
+            TextView msg = Ui.text(this, "AI Studio için web sohbet geçmişi çekme özelliği henüz eklenmedi. Şimdilik bu özelliği Gemini kaynağında kullanabilirsin.", 13, Ui.MUTED);
+            msg.setLineSpacing(0, 1.28f); LinearLayout.LayoutParams ml = new LinearLayout.LayoutParams(-1, -2); ml.topMargin = Ui.dp(10); box.addView(msg, ml);
+            TextView ok = Ui.pill(this, "Tamam", 13.5f, 0xFFFFFFFF, Ui.TEXT, 0); ok.setOnClickListener(v -> d.dismiss());
+            LinearLayout.LayoutParams ol = new LinearLayout.LayoutParams(-1, Ui.dp(42)); ol.topMargin = Ui.dp(16); box.addView(ok, ol);
+            wrap.addView(box, new LinearLayout.LayoutParams(-1, -2)); d.setContentView(wrap);
+            Window w = d.getWindow(); if (w != null) { w.setBackgroundDrawable(new ColorDrawable(0)); w.setGravity(Gravity.CENTER); w.setDimAmount(0.4f); w.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT); }
+            d.show(); return;
+        }
+        TextView tt = Ui.text(this, "Gemini sohbetleri", 17, Ui.TEXT); tt.setTypeface(Typeface.SERIF, Typeface.BOLD); box.addView(tt);
+        final TextView sub = Ui.text(this, "Gemini geçmişi yükleniyor…", 12, Ui.MUTED); LinearLayout.LayoutParams sl = new LinearLayout.LayoutParams(-1, -2); sl.topMargin = Ui.dp(5); box.addView(sub, sl);
+        ScrollView sv = new ScrollView(this) { @Override protected void onMeasure(int wS, int hS) { int m = Ui.dp(320); if (MeasureSpec.getMode(hS) == MeasureSpec.UNSPECIFIED || MeasureSpec.getSize(hS) > m) hS = MeasureSpec.makeMeasureSpec(m, MeasureSpec.AT_MOST); super.onMeasure(wS, hS); } };
+        sv.setVerticalScrollBarEnabled(false); final LinearLayout listBox = new LinearLayout(this); listBox.setOrientation(LinearLayout.VERTICAL); sv.addView(listBox, new ViewGroup.LayoutParams(-1, -2));
+        LinearLayout.LayoutParams svl = new LinearLayout.LayoutParams(-1, -2); svl.topMargin = Ui.dp(12); box.addView(sv, svl);
+        LinearLayout bot = new LinearLayout(this); bot.setGravity(Gravity.END); LinearLayout.LayoutParams bl = new LinearLayout.LayoutParams(-1, -2); bl.topMargin = Ui.dp(14);
+        final TextView ref = Ui.pill(this, "Yenile", 12.5f, Ui.TEXT, Ui.BUBBLE, Ui.BORDER); bot.addView(ref);
+        TextView cls = Ui.pill(this, "Kapat", 12.5f, Ui.MUTED, Ui.SURFACE, Ui.BORDER); cls.setOnClickListener(v -> d.dismiss()); LinearLayout.LayoutParams cl = new LinearLayout.LayoutParams(-2, -2); cl.leftMargin = Ui.dp(8); bot.addView(cls, cl); box.addView(bot, bl);
+        wrap.addView(box, new LinearLayout.LayoutParams(-1, -2)); d.setContentView(wrap);
+        Window w = d.getWindow(); if (w != null) { w.setBackgroundDrawable(new ColorDrawable(0)); w.setGravity(Gravity.CENTER); w.setDimAmount(0.4f); w.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT); }
+        final boolean[] alive = { true, false }; d.setOnDismissListener(di -> { alive[0] = false; if (!alive[1] && !core.generating) session.cancelQueue(); });
+        ref.setOnClickListener(v -> loadImportList(d, sub, listBox, alive)); d.show(); loadImportList(d, sub, listBox, alive);
+    }
+    private void loadImportList(final Dialog d, final TextView sub, final LinearLayout listBox, final boolean[] alive) {
+        listBox.removeAllViews(); listBox.addView(Ui.text(this, "Sohbet başlıkları alınıyor…", 12.5f, Ui.MUTED));
+        if (session.status() == WebSession.ST_LOGIN) {
+            sub.setText("Giriş gerekli — Web sekmesinden hesabına gir"); listBox.removeAllViews();
+            TextView wb = Ui.pill(this, "Web sekmesini aç", 13, 0xFFFFFFFF, Ui.TEXT, 0); wb.setOnClickListener(v -> { d.dismiss(); showWeb(true); }); listBox.addView(wb, new LinearLayout.LayoutParams(-1, Ui.dp(42))); return;
+        }
+        sub.setText(session.isUsable() ? "Başlıklar okunuyor…" : "Gemini oturumu hazırlanıyor…");
+        session.whenUsable(() -> {
+            if (!alive[0] || core.site != Site.GEMINI) return; sub.setText("Başlıklar okunuyor…");
+            session.op("listChats", null, r -> {
+                if (!alive[0]) return; listBox.removeAllViews();
+                JSONArray arr = r.optBoolean("ok") ? r.optJSONArray("chats") : null;
+                if (arr == null || arr.length() == 0) { sub.setText("Sohbet bulunamadı"); listBox.addView(Ui.text(this, "Gemini geçmişi boş veya henüz yüklenemedi. Web sekmesinden giriş durumunu kontrol edip Yenile'ye dokunabilirsin.", 12.5f, Ui.MUTED)); return; }
+                sub.setText(arr.length() + " sohbet · yüklemek istediğine dokun");
+                for (int i = 0; i < arr.length(); i++) {
+                    JSONObject item = arr.optJSONObject(i); if (item == null) continue;
+                    final String cTitle = item.optString("title", "Sohbet"), cUrl = item.optString("url", ""); if (cUrl.isEmpty()) continue;
+                    TextView row = Ui.text(this, cTitle, 13.5f, Ui.TEXT); row.setSingleLine(true); row.setEllipsize(android.text.TextUtils.TruncateAt.END);
+                    row.setPadding(Ui.dp(12), Ui.dp(11), Ui.dp(12), Ui.dp(11)); row.setBackground(Ui.ripple(Ui.round(Ui.SURFACE, 12, Ui.BORDER, 1)));
+                    row.setOnClickListener(v -> { alive[1] = true; d.dismiss(); importGeminiChat(cTitle, cUrl); });
+                    LinearLayout.LayoutParams rl = new LinearLayout.LayoutParams(-1, -2); if (i > 0) rl.topMargin = Ui.dp(6); listBox.addView(row, rl);
+                }
+            }, 25000);
+        });
+    }
+    private void importGeminiChat(final String title, final String url) {
+        if (core.generating) { toast("Önce yanıtın bitmesini bekle ya da durdur"); return; }
+        final int seq = ++core.importSeq; final Dialog ld = new Dialog(this); ld.requestWindowFeature(Window.FEATURE_NO_TITLE); ld.setCancelable(false);
+        LinearLayout wrap = new LinearLayout(this); wrap.setPadding(Ui.dp(26), Ui.dp(16), Ui.dp(26), Ui.dp(16));
+        LinearLayout box = new LinearLayout(this); box.setOrientation(LinearLayout.VERTICAL); box.setBackground(Ui.round(Ui.BG, 22, Ui.BORDER, 1)); box.setPadding(Ui.dp(20), Ui.dp(18), Ui.dp(20), Ui.dp(18));
+        TextView tt = Ui.text(this, "Sohbet yükleniyor", 16.5f, Ui.TEXT); tt.setTypeface(Typeface.SERIF, Typeface.BOLD); box.addView(tt);
+        final TextView st = Ui.text(this, title + "\n\nSayfa açılıyor…", 13, Ui.MUTED); st.setLineSpacing(0, 1.28f); LinearLayout.LayoutParams sl = new LinearLayout.LayoutParams(-1, -2); sl.topMargin = Ui.dp(8); box.addView(st, sl);
+        TextView cancel = Ui.pill(this, "İptal", 13, Ui.MUTED, Ui.SURFACE, Ui.BORDER); cancel.setOnClickListener(v -> { core.importSeq++; session.cancelQueue(); ld.dismiss(); });
+        LinearLayout.LayoutParams cl = new LinearLayout.LayoutParams(-1, Ui.dp(40)); cl.topMargin = Ui.dp(14); box.addView(cancel, cl); wrap.addView(box, new LinearLayout.LayoutParams(-1, -2)); ld.setContentView(wrap);
+        Window w = ld.getWindow(); if (w != null) { w.setBackgroundDrawable(new ColorDrawable(0)); w.setGravity(Gravity.CENTER); w.setDimAmount(0.4f); w.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT); } ld.show();
+        core.boundChatId = null; core.boundSite = null; session.open(Site.GEMINI, url);
+        final Runnable[] to = { () -> { if (seq == core.importSeq && ld.isShowing()) { core.importSeq++; session.cancelQueue(); ld.dismiss(); toast("Sohbet zamanında yüklenemedi, Web sekmesinden kontrol et"); } } };
+        h.postDelayed(to[0], 55000);
+        session.whenUsable(() -> {
+            h.removeCallbacks(to[0]); if (seq != core.importSeq) return; st.setText(title + "\n\nMesajlar alınıyor…");
+            session.op("readChat", null, r -> {
+                if (seq != core.importSeq) return; JSONArray arr = r.optBoolean("ok") ? r.optJSONArray("turns") : null;
+                if (arr == null || arr.length() == 0) { core.importSeq++; ld.dismiss(); toast("Sohbet okunamadı (" + r.optString("err", "boş") + ")"); return; }
+                final List<Msg> msgs = new ArrayList<>(); final List<List<String>> imgUrls = new ArrayList<>(); int tot = 0;
+                for (int i = 0; i < arr.length(); i++) {
+                    JSONObject o = arr.optJSONObject(i); if (o == null) continue; String role = "a".equals(o.optString("role")) ? Msg.AI : Msg.USER;
+                    Msg m = new Msg(role, o.optString("text", ""), null, role.equals(Msg.AI) ? Site.GEMINI.id : null);
+                    List<String> u = new ArrayList<>(); JSONArray ia = o.optJSONArray("imgs"); if (ia != null) for (int k = 0; k < ia.length(); k++) { String s = ia.optString(k); if (!s.isEmpty()) u.add(s); }
+                    tot += u.size(); msgs.add(m); imgUrls.add(u);
+                }
+                if (msgs.isEmpty()) { core.importSeq++; ld.dismiss(); toast("Sohbette okunabilir mesaj yok"); return; }
+                if (tot > 0) st.setText(title + "\n\nGörseller indiriliyor (" + tot + ")…");
+                importTurnsImages(msgs, imgUrls, 0, seq, () -> {
+                    if (seq != core.importSeq) return; core.importSeq++; if (!isFinishing() && !isDestroyed() && ld.isShowing()) ld.dismiss(); session.markUsed();
+                    Chat c = new Chat(); c.title = core.makeTitle(title); c.site = Site.GEMINI.id; c.msgs.addAll(msgs); core.finishImportedChat(c); toast("Sohbet yüklendi (" + c.msgs.size() + " mesaj)");
+                });
+            }, 45000);
+        });
+    }
+    private void importTurnsImages(final List<Msg> msgs, final List<List<String>> imgUrls, final int idx, final int seq, final Runnable done) {
+        if (seq != core.importSeq) return; if (idx >= msgs.size()) { done.run(); return; } List<String> urls = imgUrls.get(idx);
+        if (urls.isEmpty()) { importTurnsImages(msgs, imgUrls, idx + 1, seq, done); return; }
+        session.fetchImages(urls, names -> { if (seq != core.importSeq) return; msgs.get(idx).imgs.addAll(names); importTurnsImages(msgs, imgUrls, idx + 1, seq, done); });
+    }
+
     private void openDrawer() {
         refreshDrawer();
         hideKeyboard();
@@ -487,7 +561,7 @@ public class MainActivity extends Activity implements WebSession.Listener {
             LinearLayout row = new LinearLayout(this);
             row.setOrientation(LinearLayout.VERTICAL);
             row.setPadding(Ui.dp(10), Ui.dp(9), Ui.dp(10), Ui.dp(9));
-            boolean cur = c.id.equals(chat.id);
+            boolean cur = c.id.equals(core.chat.id);
             row.setBackground(Ui.ripple(cur ? Ui.round(Ui.BUBBLE, 10, 0, 0) : null));
             TextView t = Ui.text(this, c.title, 13.5f, Ui.TEXT);
             t.setSingleLine(true);
@@ -505,7 +579,7 @@ public class MainActivity extends Activity implements WebSession.Listener {
                             new AlertDialog.Builder(this).setTitle("Sohbet silinsin mi?").setMessage(c.title)
                                     .setPositiveButton("Sil", (d2, w2) -> {
                                         store.delete(c.id);
-                                        if (c.id.equals(chat.id)) newChat();
+                                        if (c.id.equals(core.chat.id)) core.newChat();
                                         refreshDrawer();
                                     }).setNegativeButton("Vazgeç", null).show();
                         }).show();
@@ -516,37 +590,36 @@ public class MainActivity extends Activity implements WebSession.Listener {
     }
 
     // ================================================================== sohbet yönetimi
-    private void newChat() {
-        if (generating) { toast("Önce yanıtın bitmesini bekle ya da durdur"); return; }
-        chat = new Chat();
-        chat.site = site.id;
-        boundChatId = null;
-        renderChat();
-        boolean reloaded = false;
-        if (session.isConnected() && !session.isFresh()) { session.newChat(); reloaded = true; }
-        else if (!session.isConnected()) { session.open(site, site.newChatUrl); reloaded = true; }
-        if (reloaded) invalidateUploads(true);
-    }
-
-    private void openChat(String id) {
-        if (generating) { toast("Önce yanıtın bitmesini bekle ya da durdur"); return; }
-        Chat c = store.load(id);
-        if (c == null) return;
-        chat = c;
-        boundChatId = null;
-        renderChat();
-        if (!atts.isEmpty() && !session.isFresh() && session.isConnected()) {
-            session.open(site, site.newChatUrl);
-            invalidateUploads(true);
-        }
-    }
+    private void newChat() { core.newChat(); }
+    private void openChat(String id) { core.openChat(id); }
 
     private void renderChat() {
         messages.removeAllViews();
-        curMd = null; curFoot = null;
-        for (Msg m : chat.msgs) messages.addView(m.role.equals(Msg.USER) ? userView(m) : aiView(m));
-        welcome.setVisibility(chat.msgs.isEmpty() ? View.VISIBLE : View.GONE);
-        titleTv.setText(chat.msgs.isEmpty() ? "Raphael" : chat.title);
+        lastSwitchBanner = null; lastErrView = null; lastAiCol = null;
+        curMd = null; curFoot = null; curThWrap = null; curThHdr = null; curThBody = null; curThOpen = false;
+        h.removeCallbacks(uiTimerR);
+        for (Msg m : core.chat.msgs) {
+            View v = m.role.equals(Msg.USER) ? userView(m) : aiView(m);
+            messages.addView(v);
+            if (!m.role.equals(Msg.USER) && v instanceof LinearLayout) lastAiCol = (LinearLayout) v;
+        }
+        if (core.generating) {
+            startAiUi(false);
+            if (!core.curThText.isEmpty() || core.curThActive) {
+                curThWrap.setVisibility(View.VISIBLE);
+                if (!core.curThText.isEmpty()) curThBody.setText(core.curThText);
+                curThHdr.setText((curThOpen ? "▾ " : "▸ ") + (core.curThActive && core.curText.isEmpty() ? "Düşünüyor…" : "Düşünce"));
+            }
+            if (!core.curText.isEmpty()) { hasUiText = true; curMd.setMarkdown(core.curText); }
+            updateTimerFoot();
+        } else if (core.pendingApprovalActions != null && core.chat.id.equals(core.pendingApprovalChatId) && lastAiCol != null) {
+            lastAiCol.addView(CodeUi.buildApprovalCard(this, core.pendingApprovalActions, codeHost()));
+        } else if (core.lastErr != null) {
+            showErrView(core.lastErr);
+        }
+        welcome.setVisibility(core.chat.msgs.isEmpty() && !core.generating ? View.VISIBLE : View.GONE);
+        titleTv.setText(core.chat.msgs.isEmpty() ? "Raphael" : core.chat.title);
+        updateSendBtn();
         scroll.post(() -> scroll.scrollTo(0, messages.getBottom()));
     }
 
@@ -704,6 +777,7 @@ public class MainActivity extends Activity implements WebSession.Listener {
     @Override
     public void onRequestPermissionsResult(int req, String[] perms, int[] res) {
         super.onRequestPermissionsResult(req, perms, res);
+        if (req == REQ_CODE_PERM) { Runnable r = pendingPermR; pendingPermR = null; if (res.length > 0 && res[0] == PackageManager.PERMISSION_GRANTED) { if (r != null) r.run(); } else toast("Depolama izni olmadan raphael klasörü kullanılamaz"); return; }
         if (req == REQ_SAVE_PERM) {
             File f = pendingSaveFile; byte[] d = pendingSaveBytes; String nm = pendingSaveName, mm = pendingSaveMime;
             pendingSaveFile = null; pendingSaveBytes = null; pendingSaveName = null; pendingSaveMime = null;
@@ -902,318 +976,62 @@ public class MainActivity extends Activity implements WebSession.Listener {
         return f;
     }
 
-    // ================================================================== gönderme
-    private void onSendClick() {
-        if (generating) { stopGen(); return; }
-        doSend();
-    }
-
-    private void stopGen() {
-        if (awaitingStart) {               // henüz siteye gönderilmedi
-            session.cancelQueue();
-            failAi("İptal edildi.");
-            return;
-        }
-        session.stopGeneration();
-        if (curFoot != null) curFoot.setText("Durduruluyor…");
-    }
-
-    private String fenceFor(String s) {
-        int run = 0, max = 2, cur = 0;
-        for (int i = 0; i < s.length(); i++) { if (s.charAt(i) == '`') { cur++; if (cur > max) max = cur; } else cur = 0; }
-        StringBuilder f = new StringBuilder();
-        for (int i = 0; i < max + 1; i++) f.append('`');
-        return f.toString();
-    }
-
-    private void doSend() {
-        String typed = input.getText().toString().trim();
-        if (typed.isEmpty() && atts.isEmpty()) return;
-        if (activeUpload != null) { toast("Dosya işlemi sürüyor, bir saniye bekle…"); return; }
-        for (Att a : atts) {
-            if (!a.text && a.upState == 1) { toast("Dosya siteye yükleniyor, bitmesini bekle…"); return; }
-            if (!a.text && a.upState == 3) { toast("Yüklenemeyen dosya var; çarpıdan kaldır veya dokunup tekrar dene"); return; }
-        }
-
-        boolean boundOk = chat.id.equals(boundChatId) && boundSite == site && session.isConnected();
-        int prior = chat.msgs.size();
-        boolean reload = !boundOk && !session.isFresh();
-
-        StringBuilder full = new StringBuilder(), names = new StringBuilder();
-        final List<WebSession.Upload> ups = new ArrayList<>();
-        List<String> imgNames = new ArrayList<>();
-        for (Att a : atts) {
-            if (names.length() > 0) names.append(", ");
-            names.append(a.name);
-            if (!a.tokens.isEmpty()) names.append(" (").append(a.tokens).append(")");
-            if (a.text) {
-                String f = fenceFor(a.content);
-                full.append("Dosya: ").append(a.name).append('\n').append(f).append('\n').append(a.content).append('\n').append(f).append("\n\n");
-            } else {
-                if (reload || a.upState != 2) ups.add(new WebSession.Upload(a.id, a.name, a.mime, a.file));
-                if (a.thumb != null) imgNames.add(a.thumb);
-            }
-        }
-        full.append(typed);
-        String shown = (names.length() > 0 ? "📎 " + names + "\n" : "") + typed;
-        Msg um = new Msg(Msg.USER, full.toString(), shown, null);
-        um.imgs.addAll(imgNames);
-
-        String payload = um.text;
-        if (!boundOk && prior > 0) payload = contextPrefix(prior) + payload;
-
-        chat.msgs.add(um);
-        if (prior == 0) { chat.title = makeTitle(um.display()); chat.created = System.currentTimeMillis(); }
-        chat.site = site.id;
-        store.save(chat);
-
-        input.setText("");
-        atts.clear();
-        refreshAttach();
-        welcome.setVisibility(View.GONE);
-        titleTv.setText(chat.title);
-        messages.addView(userView(um));
-        startAi();
-
-        lastPayload = payload;
-        lastUps = ups;
-        launchSend(reload);
-    }
-
-    /** lastPayload / lastUps'u siteye gönderir (ilk gönderim ve "tekrar gönder" için ortak). */
-    private void launchSend(boolean reload) {
-        final String fp = lastPayload;
-        final List<WebSession.Upload> ups = lastUps;
-        awaitingStart = true;
-        if (reload) session.open(site, site.newChatUrl);
-        session.whenUsable(() -> {
-            awaitingStart = false;
-            boundChatId = chat.id;
-            boundSite = site;
-            session.sendWithFiles(fp, ups);
-        });
-        h.postDelayed(() -> {
-            if (generating && awaitingStart) {
-                session.cancelQueue();
-                failAi("Web oturumu hazır olmadı. Web sekmesinden giriş yapıp tekrar dene.");
-            }
-        }, 80000);
-    }
-
-    private String contextPrefix(int upto) {
-        List<String> parts = new ArrayList<>();
-        int budget = 24000;
-        for (int i = upto - 1; i >= 0 && budget > 0; i--) {
-            Msg m = chat.msgs.get(i);
-            String t = m.text;
-            if (t.length() > 7000) t = t.substring(0, 3500) + "\n[...kısaltıldı...]\n" + t.substring(t.length() - 3000);
-            String p = (m.role.equals(Msg.USER) ? "[Kullanıcı]\n" : "[Asistan]\n") + t;
-            budget -= p.length();
-            parts.add(0, p);
-        }
-        StringBuilder sb = new StringBuilder("Aşağıda bu sohbetin önceki bölümü var. Sadece bağlam olarak kullan, tekrar özetleme.\n\n");
-        for (String p : parts) sb.append(p).append("\n\n");
-        sb.append("--- Önceki bölümün sonu. Yeni mesajım: ---\n");
-        return sb.toString();
-    }
-
-    private String makeTitle(String s) {
-        String t = s.replace("📎", "").replaceAll("\\s+", " ").trim();
-        if (t.length() > 42) t = t.substring(0, 42).trim() + "…";
-        return t.isEmpty() ? "Sohbet" : t;
-    }
-
-    private void startAi() {
-        generating = true;
-        gotFirstText = false;
-        stage = "";
-        curText = "";
-        genStart = System.currentTimeMillis();
-        curThActive = false; curThOpen = false;
-        LinearLayout col = new LinearLayout(this);
-        col.setOrientation(LinearLayout.VERTICAL);
-        curThWrap = new LinearLayout(this);
-        curThWrap.setOrientation(LinearLayout.VERTICAL);
-        curThWrap.setBackground(Ui.round(Ui.CODEBG, 10, Ui.BORDER, 1));
-        curThWrap.setPadding(Ui.dp(10), Ui.dp(7), Ui.dp(10), Ui.dp(7));
-        curThWrap.setVisibility(View.GONE);
-        LinearLayout.LayoutParams thl = new LinearLayout.LayoutParams(-1, -2);
-        thl.bottomMargin = Ui.dp(8);
-        curThHdr = Ui.text(this, "▸ Düşünüyor…", 11.5f, Ui.MUTED);
-        curThWrap.addView(curThHdr, new LinearLayout.LayoutParams(-1, -2));
-        curThBody = Ui.text(this, "", 12f, Ui.MUTED);
-        curThBody.setLineSpacing(0, 1.25f);
-        curThBody.setPadding(0, Ui.dp(6), 0, 0);
-        curThBody.setVisibility(View.GONE);
-        curThWrap.addView(curThBody, new LinearLayout.LayoutParams(-1, -2));
+    private void onSendClick() { if (core.generating) { core.stopGen(); if (!core.awaitingStart && curFoot != null) curFoot.setText("Durduruluyor…"); return; } doSend(); }
+    private void doSend() { String t = input.getText().toString().trim(); if (t.isEmpty() && core.atts.isEmpty()) return; if (core.atts.isEmpty() && handleSlashInput(t)) return; if (core.doSendUser(t)) input.setText(""); }
+    private void startAiUi(boolean resetTh) {
+        if (resetTh) curThOpen = false; hasUiText = false;
+        LinearLayout col = new LinearLayout(this); col.setOrientation(LinearLayout.VERTICAL); lastAiCol = col;
+        curThWrap = new LinearLayout(this); curThWrap.setOrientation(LinearLayout.VERTICAL); curThWrap.setBackground(Ui.round(Ui.CODEBG, 10, Ui.BORDER, 1)); curThWrap.setPadding(Ui.dp(10), Ui.dp(7), Ui.dp(10), Ui.dp(7)); curThWrap.setVisibility(View.GONE);
+        LinearLayout.LayoutParams thl = new LinearLayout.LayoutParams(-1, -2); thl.bottomMargin = Ui.dp(8);
+        curThHdr = Ui.text(this, "▸ Düşünüyor…", 11.5f, Ui.MUTED); curThWrap.addView(curThHdr, new LinearLayout.LayoutParams(-1, -2));
+        curThBody = Ui.text(this, "", 12f, Ui.MUTED); curThBody.setLineSpacing(0, 1.25f); curThBody.setPadding(0, Ui.dp(6), 0, 0); curThBody.setVisibility(View.GONE); curThWrap.addView(curThBody, new LinearLayout.LayoutParams(-1, -2));
         final LinearLayout tw = curThWrap; final TextView th = curThHdr, tb = curThBody;
-        tw.setOnClickListener(v -> {
-            boolean open = tb.getVisibility() != View.VISIBLE;
-            tb.setVisibility(open ? View.VISIBLE : View.GONE);
-            if (tw == curThWrap) curThOpen = open;
-            String ct = th.getText().toString();
-            th.setText((open ? "▾ " : "▸ ") + (ct.length() > 2 ? ct.substring(2) : ct));
-        });
-        col.addView(curThWrap, thl);
-        curMd = newMd();
-        col.addView(curMd, new LinearLayout.LayoutParams(-1, -2));
-        curFoot = Ui.text(this, "Yanıt bekleniyor…", 11.5f, Ui.MUTED);
-        col.addView(curFoot, footLp());
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-        lp.topMargin = Ui.dp(18);
-        messages.addView(col, lp);
-        updateSendBtn();
-        scrollBottom();
-        h.removeCallbacks(timerR);
-        h.postDelayed(timerR, 1000);
+        tw.setOnClickListener(v -> { boolean o = tb.getVisibility() != View.VISIBLE; tb.setVisibility(o ? View.VISIBLE : View.GONE); if (tw == curThWrap) curThOpen = o; String ct = th.getText().toString(); th.setText((o ? "▾ " : "▸ ") + (ct.length() > 2 ? ct.substring(2) : ct)); });
+        col.addView(curThWrap, thl); curMd = newMd(); col.addView(curMd, new LinearLayout.LayoutParams(-1, -2));
+        curFoot = Ui.text(this, "Yanıt bekleniyor…", 11.5f, Ui.MUTED); col.addView(curFoot, footLp());
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2); lp.topMargin = Ui.dp(18); messages.addView(col, lp); updateSendBtn(); scrollBottom(); h.removeCallbacks(uiTimerR); h.postDelayed(uiTimerR, 1000);
     }
+    private void updateTimerFoot() { if (!core.generating || curFoot == null) return; long sec = Math.max(0, (System.currentTimeMillis() - core.genStart) / 1000); String b = !core.stage.isEmpty() ? core.stage : core.awaitingStart ? "Web oturumu hazırlanıyor…" : core.gotFirstText ? "Yazıyor…" : core.curThActive ? "Düşünüyor…" : "Yanıt bekleniyor…"; curFoot.setText(b + " " + sec + " sn"); }
+    private final Runnable uiTimerR = new Runnable() { @Override public void run() { if (!core.generating || curFoot == null) return; updateTimerFoot(); h.postDelayed(this, 1000); } };
+    private void showErrView(String err) { boolean act = !err.startsWith("İptal"); TextView e = Ui.text(this, act ? err + "  (Seçenekler için dokun)" : err, 12.5f, Ui.RED); LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2); lp.topMargin = Ui.dp(14); messages.addView(e, lp); if (act) { e.setOnClickListener(v -> errorActions()); lastErrView = e; } }
+    private void errorActions() { if (!core.generating) new AlertDialog.Builder(this).setTitle("Ne yapalım?").setItems(new String[]{"Cevabı web'den çek", "Mesajı tekrar gönder", "Web sekmesini aç"}, (d, w) -> { if (w == 0) recoverFromWeb(); else if (w == 1) resendLast(); else showWeb(true); }).show(); }
+    private void dropErrView() { if (lastErrView != null && lastErrView.getParent() == messages) messages.removeView(lastErrView); lastErrView = null; }
+    private void recoverFromWeb() { if (!core.generating) { dropErrView(); core.recoverFromWeb(); } }
+    private void resendLast() { if (!core.generating) { dropErrView(); core.resendLast(); } }
+    private void addSwitchBanner(String txt) { TextView tv = Ui.pill(this, txt, 11f, Ui.MUTED, Ui.BUBBLE, 0); tv.setPadding(Ui.dp(12), Ui.dp(5), Ui.dp(12), Ui.dp(5)); LinearLayout w = new LinearLayout(this); w.setGravity(Gravity.CENTER); w.addView(tv, new LinearLayout.LayoutParams(-2, -2)); LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2); lp.topMargin = Ui.dp(16); messages.addView(w, lp); lastSwitchBanner = w; }
 
-    private final Runnable timerR = new Runnable() {
-        @Override public void run() {
-            if (!generating || curFoot == null) return;
-            long s = (System.currentTimeMillis() - genStart) / 1000;
-            String base = !stage.isEmpty() ? stage : awaitingStart ? "Web oturumu hazırlanıyor…" : gotFirstText ? "Yazıyor…" : curThActive ? "Düşünüyor…" : "Yanıt bekleniyor…";
-            curFoot.setText(base + " " + s + " sn");
-            h.postDelayed(this, 1000);
-        }
-    };
-
-    private void finishAi(String md) {
-        generating = false;
-        h.removeCallbacks(timerR);
-        Msg am = new Msg(Msg.AI, md, null, site.id);
-        am.imgs.addAll(pendingImgs);
-        pendingImgs = new ArrayList<>();
-        chat.msgs.add(am);
-        store.save(chat);
-        stage = "";
-        if (curFoot != null && curFoot.getParent() instanceof LinearLayout) {
-            LinearLayout col = (LinearLayout) curFoot.getParent();
-            col.removeView(curFoot);
-            if (!am.imgs.isEmpty()) col.addView(imagesRow(am.imgs, false), new LinearLayout.LayoutParams(-1, -2));
-            col.addView(doneFooter(md, site.id), footLp());
-        }
-        if (curThHdr != null && curThWrap != null && curThWrap.getVisibility() == View.VISIBLE) curThHdr.setText((curThOpen ? "▾ " : "▸ ") + "Düşünce");
-        curThWrap = null; curThHdr = null; curThBody = null; curThActive = false;
-        curMd = null; curFoot = null;
-        updateSendBtn();
-        pumpPreUpload();
-    }
-
-    private void failAi(String err) {
-        generating = false;
-        awaitingStart = false;
-        stage = "";
-        pendingImgs = new ArrayList<>();
-        h.removeCallbacks(timerR);
-        boolean actions = !err.startsWith("İptal");
-        String shownErr = actions ? err + "  (Seçenekler için dokun)" : err;
-        lastErrView = null;
-        if (curMd != null && curText.isEmpty() && curMd.getParent() instanceof LinearLayout) {
-            View col = (View) curMd.getParent();
-            messages.removeView(col);
-            TextView e = Ui.text(this, shownErr, 12.5f, Ui.RED);
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-            lp.topMargin = Ui.dp(14);
-            messages.addView(e, lp);
-            if (actions) { e.setOnClickListener(v -> errorActions()); lastErrView = e; }
-        } else if (curFoot != null) {
-            curFoot.setText(shownErr);
-            curFoot.setTextColor(Ui.RED);
-            if (!curText.isEmpty()) { chat.msgs.add(new Msg(Msg.AI, curText, null, site.id)); store.save(chat); }
-            if (actions) { curFoot.setOnClickListener(v -> errorActions()); if (curFoot.getParent() instanceof View) lastErrView = (View) curFoot.getParent(); }
-        }
-        if (curThHdr != null && curThWrap != null && curThWrap.getVisibility() == View.VISIBLE) curThHdr.setText((curThOpen ? "▾ " : "▸ ") + "Düşünce");
-        curThWrap = null; curThHdr = null; curThBody = null; curThActive = false;
-        curMd = null; curFoot = null;
-        updateSendBtn();
-        scrollBottom();
-        pumpPreUpload();
-    }
-
-    private void errorActions() {
-        if (generating) return;
-        new AlertDialog.Builder(this).setTitle("Ne yapalım?")
-                .setItems(new String[]{"Cevabı web'den çek", "Mesajı tekrar gönder", "Web sekmesini aç"}, (d, w) -> {
-                    if (w == 0) recoverFromWeb();
-                    else if (w == 1) resendLast();
-                    else showWeb(true);
-                }).show();
-    }
-
-    private void dropErrView() {
-        if (lastErrView != null && lastErrView.getParent() == messages) messages.removeView(lastErrView);
-        lastErrView = null;
-    }
-
-    private void recoverFromWeb() {
-        if (generating) return;
-        dropErrView();
-        startAi();
-        awaitingStart = false;
-        session.recover();
-    }
-
-    private void resendLast() {
-        if (generating || lastPayload == null || (lastPayload.isEmpty() && lastUps.isEmpty())) { toast("Tekrar gönderilecek bir şey yok"); return; }
-        dropErrView();
-        startAi();
-        launchSend(false);
-    }
-
-    // ================================================================== WebSession.Listener
-    @Override public void onStatus(int st, String info) {
+    @Override public void onCoreStatus(int st, String info) {
         int c = st == WebSession.ST_READY ? Ui.GREEN : st == WebSession.ST_LOADING ? Ui.AMBER : st == WebSession.ST_LOGIN ? Ui.RED : Ui.MUTED;
-        String tk = session.tokens();
-        String txt = site.label + " · " + info + (site == Site.AISTUDIO && !tk.isEmpty() ? " · " + tk : "");
-        statusDot.setBackground(Ui.round(c, 4, 0, 0));
-        statusTv.setText(txt);
-        webDot.setBackground(Ui.round(c, 4, 0, 0));
-        webStatusTv.setText(info);
-        updateWebBar();
+        String tk = session.tokens(); String txt = core.site.label + " · " + info + (core.site == Site.AISTUDIO && !tk.isEmpty() ? " · " + tk : "");
+        statusDot.setBackground(Ui.round(c, 4, 0, 0)); statusTv.setText(txt); webDot.setBackground(Ui.round(c, 4, 0, 0)); webStatusTv.setText(info); updateWebBar();
     }
-
-    @Override public void onReply(String md, boolean done) {
-        if (curMd == null) return;
-        boolean at = isAtBottom();
-        curText = md;
-        if (!md.isEmpty()) { gotFirstText = true; stage = ""; if (curThHdr != null && curThWrap != null && curThWrap.getVisibility() == View.VISIBLE) curThHdr.setText((curThOpen ? "▾ " : "▸ ") + "Düşünce"); }
-        curMd.setMarkdown(md);
-        if (done) { finishAi(md); }
-        if (at) scrollBottom();
+    @Override public void onCoreChatChanged() { renderChat(); refreshCodeUi(); refreshAttach(); updateChip(); }
+    @Override public void onCoreUserMsg(Msg m) { dropErrView(); welcome.setVisibility(View.GONE); titleTv.setText(core.chat.title); messages.addView(userView(m)); scrollBottom(); }
+    @Override public void onCoreAiStart(String switchBanner) { dropErrView(); welcome.setVisibility(View.GONE); if (switchBanner != null && !switchBanner.isEmpty()) addSwitchBanner(switchBanner); startAiUi(true); }
+    @Override public void onCoreAiThinking(String text, boolean active) { if (curThWrap == null) return; boolean at = isAtBottom(); curThWrap.setVisibility(View.VISIBLE); if (text != null && !text.isEmpty()) curThBody.setText(text); curThHdr.setText((curThOpen ? "▾ " : "▸ ") + (active && !hasUiText ? "Düşünüyor…" : "Düşünce")); if (at) scrollBottom(); }
+    @Override public void onCoreAiReply(String md) { if (curMd == null) return; boolean at = isAtBottom(); if (!md.isEmpty()) { hasUiText = true; if (curThHdr != null && curThWrap != null && curThWrap.getVisibility() == View.VISIBLE) curThHdr.setText((curThOpen ? "▾ " : "▸ ") + "Düşünce"); } curMd.setMarkdown(md); if (at) scrollBottom(); }
+    @Override public void onCoreAiDone(Msg am, List<CodeProtocol.Action> approval) {
+        h.removeCallbacks(uiTimerR); boolean at = isAtBottom(); if (curMd != null) curMd.setMarkdown(am.text);
+        if (curFoot != null && curFoot.getParent() instanceof LinearLayout) { LinearLayout col = (LinearLayout) curFoot.getParent(); lastAiCol = col; col.removeView(curFoot); if (!am.imgs.isEmpty()) col.addView(imagesRow(am.imgs, false), new LinearLayout.LayoutParams(-1, -2)); col.addView(doneFooter(am.text, am.site), footLp()); }
+        if (curThHdr != null && curThWrap != null && curThWrap.getVisibility() == View.VISIBLE) curThHdr.setText((curThOpen ? "▾ " : "▸ ") + "Düşünce");
+        if (approval != null && !approval.isEmpty() && lastAiCol != null) lastAiCol.addView(CodeUi.buildApprovalCard(this, approval, codeHost()));
+        curThWrap = null; curThHdr = null; curThBody = null; lastSwitchBanner = null; curMd = null; curFoot = null; updateSendBtn(); if (at) scrollBottom();
     }
-
-    @Override public void onReplyError(String err) { if (generating) failAi(err); }
-
-    @Override public void onImages(List<String> names) { pendingImgs = new ArrayList<>(names); }
-
-    @Override public void onStage(String t) { stage = t == null ? "" : t; }
-
-    @Override public void onThinking(String text, boolean active) {
-        if (curThWrap == null) return;
-        boolean has = text != null && !text.trim().isEmpty();
-        if (!has && !active) return;
-        boolean at = isAtBottom();
-        curThActive = active;
-        curThWrap.setVisibility(View.VISIBLE);
-        if (has) curThBody.setText(text.trim());
-        curThHdr.setText((curThOpen ? "▾ " : "▸ ") + (active && curText.isEmpty() ? "Düşünüyor…" : "Düşünce"));
-        if (at) scrollBottom();
+    @Override public void onCoreCodeAutoDone(List<CodeProtocol.ExecResult> res, boolean sentBack, boolean hasUndo) { if (lastAiCol == null) return; LinearLayout card = new LinearLayout(this); card.setOrientation(LinearLayout.VERTICAL); card.setBackground(Ui.round(Ui.CODEBG, 14, Ui.BORDER, 1)); card.setPadding(Ui.dp(12), Ui.dp(10), Ui.dp(12), Ui.dp(10)); LinearLayout.LayoutParams cl = new LinearLayout.LayoutParams(-1, -2); cl.topMargin = Ui.dp(8); card.setLayoutParams(cl); CodeUi.markCardDone(card, res, sentBack, hasUndo, () -> runUndoWithPerm()); lastAiCol.addView(card); scrollBottom(); }
+    @Override public void onCoreAiError(String err) {
+        h.removeCallbacks(uiTimerR); if (err.startsWith("İptal") && lastSwitchBanner != null && lastSwitchBanner.getParent() == messages) messages.removeView(lastSwitchBanner);
+        lastSwitchBanner = null; boolean act = !err.startsWith("İptal"); String shownErr = act ? err + "  (Seçenekler için dokun)" : err; lastErrView = null;
+        if (curMd != null && !hasUiText && curMd.getParent() instanceof LinearLayout) { messages.removeView((View) curMd.getParent()); showErrView(err); }
+        else if (curFoot != null) { curFoot.setText(shownErr); curFoot.setTextColor(Ui.RED); if (act) { curFoot.setOnClickListener(v -> errorActions()); if (curFoot.getParent() instanceof View) lastErrView = (View) curFoot.getParent(); } }
+        if (curThHdr != null && curThWrap != null && curThWrap.getVisibility() == View.VISIBLE) curThHdr.setText((curThOpen ? "▾ " : "▸ ") + "Düşünce");
+        curThWrap = null; curThHdr = null; curThBody = null; curMd = null; curFoot = null; updateSendBtn(); scrollBottom();
     }
-
-    @Override public boolean onFileChooser(ValueCallback<Uri[]> cb, WebChromeClient.FileChooserParams p) {
-        if (webFileCb != null) webFileCb.onReceiveValue(null);
-        webFileCb = cb;
-        try { startActivityForResult(p.createIntent(), REQ_WEBFILE); return true; }
-        catch (Exception e) { webFileCb = null; return false; }
-    }
-
-    @Override public void onNote(String msg) {
-        if (msg.startsWith("DOM kaydedildi")) {
-            new AlertDialog.Builder(this).setTitle("DOM kaydedildi").setMessage(msg.replace("DOM kaydedildi", "").trim()
-                    + "\n\nBu dosyayı DOM Analizcisi modeline yükleyebilirsin.").setPositiveButton("Tamam", null).show();
-        } else toast(msg);
-    }
+    @Override public void onCoreCodeUi() { refreshCodeUi(); }
+    @Override public void onCoreAttachUi() { refreshAttach(); }
+    @Override public void onCoreToast(String msg) { toast(msg); }
+    @Override public void onCoreNote(String msg) { if (msg.startsWith("__OPEN_CODE__:")) requestEnterCodeMode(msg.substring(14)); else if (msg.startsWith("DOM kaydedildi")) new AlertDialog.Builder(this).setTitle("DOM kaydedildi").setMessage(msg.replace("DOM kaydedildi", "").trim() + "\n\nBu dosyayı DOM Analizcisi modeline yükleyebilirsin.").setPositiveButton("Tamam", null).show(); else toast(msg); }
+    @Override public boolean onCoreFileChooser(ValueCallback<Uri[]> cb, WebChromeClient.FileChooserParams p) { if (webFileCb != null) webFileCb.onReceiveValue(null); webFileCb = cb; try { startActivityForResult(p.createIntent(), REQ_WEBFILE); return true; } catch (Exception e) { webFileCb = null; return false; } }
+    @Override public void onCoreFinish() { finish(); }
 
     // ================================================================== web sekmesi
     private void showWeb(boolean on) {
@@ -1232,48 +1050,37 @@ public class MainActivity extends Activity implements WebSession.Listener {
 
     private void updateWebBar() {
         if (webSiteBtn == null) return;
-        webSiteBtn.setText("Kaynak: " + site.label);
+        webSiteBtn.setText("Kaynak: " + core.site.label);
         webDisplayBtn.setText("Arka plan görüntü: " + (prefs.getBoolean("bg", true) ? "Açık" : "Kapalı"));
         webConnBtn.setText(session.isConnected() ? "Bağlantıyı kes" : "Bağlan");
     }
 
     // ================================================================== kaynak / model / düşünme
-    private String thinkKey() { return "think_" + site.id; }
-    private String thinking() {
-        String lv = prefs.getString(thinkKey(), "");
-        return (site != Site.AISTUDIO && "xhigh".equals(lv)) ? "" : lv;
+    private String thinking() { return core.thinking(); }
+    private String maxOutput() { return core.maxOutput(); }
+    private void pushPrefs() { core.pushPrefs(); }
+    private void updateChip() { String lv = core.thinking(); int i = 0; for (int k = 0; k < LEVELS.length; k++) if (LEVELS[k].equals(lv)) i = k; chipTv.setText(core.site.label + " · " + (i == 0 ? "Otomatik" : LEVEL_LABELS[i]) + "  ▾"); updateWebBar(); }
+
+    private void setSite(final Site s) { if (s == core.site) return; if (core.generating) { toast("Önce yanıtın bitmesini bekle ya da durdur"); return; } if (core.chat.msgs.isEmpty()) { core.applySiteSwitch(s, false); updateChip(); return; } showSwitchDialog(s.label, () -> { core.applySiteSwitch(s, true); updateChip(); }, () -> { core.applySiteSwitch(s, false); updateChip(); }); }
+    private void showSwitchDialog(String targetLabel, final Runnable onTransfer, final Runnable onFresh) {
+        final Dialog d = new Dialog(this); d.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        LinearLayout wrap = new LinearLayout(this); wrap.setPadding(Ui.dp(22), Ui.dp(16), Ui.dp(22), Ui.dp(16));
+        LinearLayout box = new LinearLayout(this); box.setOrientation(LinearLayout.VERTICAL); box.setBackground(Ui.round(Ui.BG, 22, Ui.BORDER, 1)); box.setPadding(Ui.dp(20), Ui.dp(18), Ui.dp(20), Ui.dp(18));
+        TextView tt = Ui.text(this, "Model değiştir", 17, Ui.TEXT); tt.setTypeface(Typeface.SERIF, Typeface.BOLD); box.addView(tt);
+        TextView msg = Ui.text(this, "Bu sohbette " + core.chat.msgs.size() + " mesaj var. " + targetLabel + " modeline geçerken sohbet geçmişi ne yapılsın?", 13, Ui.MUTED);
+        msg.setLineSpacing(0, 1.28f); LinearLayout.LayoutParams ml = new LinearLayout.LayoutParams(-1, -2); ml.topMargin = Ui.dp(8); box.addView(msg, ml);
+        TextView b1 = Ui.pill(this, "Sohbet geçmişini aktar", 13.5f, 0xFFFFFFFF, Ui.TEXT, 0); b1.setOnClickListener(v -> { d.dismiss(); onTransfer.run(); });
+        LinearLayout.LayoutParams l1 = new LinearLayout.LayoutParams(-1, Ui.dp(44)); l1.topMargin = Ui.dp(16); box.addView(b1, l1);
+        TextView b2 = Ui.pill(this, "Aktarmadan geçiş yap", 13.5f, Ui.TEXT, Ui.BUBBLE, Ui.BORDER); b2.setOnClickListener(v -> { d.dismiss(); onFresh.run(); });
+        LinearLayout.LayoutParams l2 = new LinearLayout.LayoutParams(-1, Ui.dp(44)); l2.topMargin = Ui.dp(8); box.addView(b2, l2);
+        TextView b3 = Ui.pill(this, "İptal", 13.5f, Ui.MUTED, Ui.SURFACE, Ui.BORDER); b3.setOnClickListener(v -> d.dismiss());
+        LinearLayout.LayoutParams l3 = new LinearLayout.LayoutParams(-1, Ui.dp(42)); l3.topMargin = Ui.dp(8); box.addView(b3, l3);
+        wrap.addView(box, new LinearLayout.LayoutParams(-1, -2)); d.setContentView(wrap);
+        Window w = d.getWindow(); if (w != null) { w.setBackgroundDrawable(new ColorDrawable(0)); w.setGravity(Gravity.CENTER); w.setDimAmount(0.4f); w.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT); }
+        d.show();
     }
 
-    private String maxOutput() { String v = prefs.getString("out_" + site.id, "65536"); return v.isEmpty() ? "65536" : v; }
-
-    private void pushPrefs() { session.setPrefs(thinking(), site.modelPicker ? prefs.getString("model_" + site.id, "") : "", site == Site.AISTUDIO ? maxOutput() : ""); }
-
-    private void updateChip() {
-        String lv = thinking();
-        int i = 0;
-        for (int k = 0; k < LEVELS.length; k++) if (LEVELS[k].equals(lv)) i = k;
-        chipTv.setText(site.label + " · " + (i == 0 ? "Otomatik" : LEVEL_LABELS[i]) + "  ▾");
-        updateWebBar();
-    }
-
-    private void setSite(Site s) {
-        if (s == site) return;
-        if (generating) { toast("Önce yanıtın bitmesini bekle ya da durdur"); return; }
-        site = s;
-        prefs.edit().putString("site", s.id).apply();
-        boundChatId = null;
-        pushPrefs();
-        updateChip();
-        session.open(s, s.newChatUrl);
-        invalidateUploads(true);
-    }
-
-    private void setThinking(String lv) {
-        prefs.edit().putString(thinkKey(), lv).apply();
-        pushPrefs();
-        updateChip();
-        if (session.isConnected()) session.reapplyPrefs();
-    }
+    private void setThinking(String lv) { core.setThinking(lv); updateChip(); }
 
     private Dialog sheet(View content) {
         final Dialog d = new Dialog(this);
@@ -1298,7 +1105,7 @@ public class MainActivity extends Activity implements WebSession.Listener {
     }
 
     private void showModelSheet() {
-        if (generating) { toast("Yanıt sürerken değiştirilemez"); return; }
+        if (core.generating) { toast("Yanıt sürerken değiştirilemez"); return; }
         LinearLayout c = new LinearLayout(this);
         c.setOrientation(LinearLayout.VERTICAL);
         c.setBackground(topRound());
@@ -1310,7 +1117,7 @@ public class MainActivity extends Activity implements WebSession.Listener {
             LinearLayout row = new LinearLayout(this);
             row.setGravity(Gravity.CENTER_VERTICAL);
             row.setPadding(Ui.dp(12), Ui.dp(11), Ui.dp(12), Ui.dp(11));
-            boolean sel = s == site;
+            boolean sel = s == core.site;
             row.setBackground(Ui.ripple(Ui.round(sel ? Ui.BUBBLE : Ui.SURFACE, 12, Ui.BORDER, sel ? 0 : 1)));
             LinearLayout tx = new LinearLayout(this);
             tx.setOrientation(LinearLayout.VERTICAL);
@@ -1331,7 +1138,7 @@ public class MainActivity extends Activity implements WebSession.Listener {
         LinearLayout.LayoutParams tl = new LinearLayout.LayoutParams(-2, -2);
         tl.topMargin = Ui.dp(18);
         c.addView(th, tl);
-        int count = site == Site.AISTUDIO ? LEVELS.length : 4;
+        int count = core.site == Site.AISTUDIO ? LEVELS.length : 4;
         String cur = thinking();
         if (count <= 4) {
             LinearLayout chips = new LinearLayout(this);
@@ -1366,12 +1173,12 @@ public class MainActivity extends Activity implements WebSession.Listener {
             }
         }
 
-        if (site.modelPicker) {
+        if (core.site.modelPicker) {
             TextView mh = Ui.text(this, "Model", 11.5f, Ui.MUTED);
             LinearLayout.LayoutParams ml = new LinearLayout.LayoutParams(-2, -2);
             ml.topMargin = Ui.dp(18);
             c.addView(mh, ml);
-            String m = prefs.getString("model_" + site.id, "");
+            String m = prefs.getString("model_" + core.site.id, "");
             TextView mb = Ui.pill(this, (m.isEmpty() ? "Sitenin varsayılanı" : m) + "   ›", 13, Ui.TEXT, Ui.SURFACE, Ui.BORDER);
             mb.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
             mb.setOnClickListener(v -> { d.dismiss(); pickModel(); });
@@ -1432,19 +1239,13 @@ public class MainActivity extends Activity implements WebSession.Listener {
     private void askModelName() {
         final EditText e = new EditText(this);
         e.setHint("örn: Gemini 3.8 Flash");
-        e.setText(prefs.getString("model_" + site.id, ""));
+        e.setText(prefs.getString("model_" + core.site.id, ""));
         new AlertDialog.Builder(this).setTitle("AI Studio model adı").setView(e)
                 .setPositiveButton("Kaydet", (d, w) -> setModel(e.getText().toString().trim()))
                 .setNegativeButton("Vazgeç", null).show();
     }
 
-    private void setModel(String name) {
-        prefs.edit().putString("model_" + site.id, name).apply();
-        pushPrefs();
-        if (session.isConnected()) session.reapplyPrefs();
-        toast(name.isEmpty() ? "Model: varsayılan" : "Model: " + name);
-    }
-
+    private void setModel(final String name) { String cur = prefs.getString("model_" + core.site.id, ""); if (name.equals(cur)) { toast(name.isEmpty() ? "Model: varsayılan" : "Model: " + name); return; } if (core.generating) { toast("Önce yanıtın bitmesini bekle ya da durdur"); return; } if (core.chat.msgs.isEmpty()) { core.applyModelSwitch(name, false); return; } String lbl = name.isEmpty() ? core.site.label + " (Varsayılan)" : name; showSwitchDialog(lbl, () -> core.applyModelSwitch(name, true), () -> core.applyModelSwitch(name, false)); }
     private void askMaxOutput() {
         final EditText e = new EditText(this);
         e.setInputType(InputType.TYPE_CLASS_NUMBER);
@@ -1461,17 +1262,7 @@ public class MainActivity extends Activity implements WebSession.Listener {
                 .setNegativeButton("Vazgeç", null).show();
     }
 
-    private void setMaxOutput(String v) {
-        if (v == null || v.isEmpty()) v = "65536";
-        String prev = maxOutput();
-        prefs.edit().putString("out_" + site.id, v).apply();
-        pushPrefs();
-        if (session.isConnected()) {
-            if ("65536".equals(v) && !"65536".equals(prev)) session.resetOutput();
-            else session.reapplyPrefs();
-        }
-        toast("Output: " + v + " token");
-    }
+    private void setMaxOutput(String v) { core.setMaxOutput(v); }
 
     // ================================================================== ayarlar
     private void showSettings() {
@@ -1537,7 +1328,7 @@ public class MainActivity extends Activity implements WebSession.Listener {
 
         TextView del = Ui.pill(this, "Tüm sohbetleri sil", 12.5f, Ui.RED, Ui.BUBBLE, 0);
         del.setOnClickListener(v -> new AlertDialog.Builder(this).setTitle("Tüm sohbetler silinsin mi?")
-                .setPositiveButton("Sil", (d, w) -> { store.deleteAll(); chat = new Chat(); boundChatId = null; renderChat(); })
+                .setPositiveButton("Sil", (d, w) -> core.deleteAllChats())
                 .setNegativeButton("Vazgeç", null).show());
         LinearLayout.LayoutParams del2 = new LinearLayout.LayoutParams(-1, Ui.dp(40));
         del2.topMargin = Ui.dp(8);
@@ -1577,9 +1368,9 @@ public class MainActivity extends Activity implements WebSession.Listener {
         toast("Dosyalar hazırlanıyor…");
         final List<Uri> fu = uris;
         new Thread(() -> {
-            final List<Att> added = new ArrayList<>();
-            for (Uri u : fu) { Att a = readAttachment(u); if (a != null) added.add(a); }
-            runOnUiThread(() -> { atts.addAll(added); refreshAttach(); pumpPreUpload(); });
+            final List<AppCore.Att> added = new ArrayList<>();
+            for (Uri u : fu) { AppCore.Att a = readAttachment(u); if (a != null) added.add(a); }
+            runOnUiThread(() -> { core.atts.addAll(added); refreshAttach(); core.pumpPreUpload(); });
         }).start();
     }
 
@@ -1621,7 +1412,7 @@ public class MainActivity extends Activity implements WebSession.Listener {
     }
 
     /** Arka plan iş parçacığında çalışır: dosyayı önbelleğe kopyalar, metin mi ikili mi karar verir. */
-    private Att readAttachment(Uri u) {
+    private AppCore.Att readAttachment(Uri u) {
         String name = "dosya";
         try (Cursor c = getContentResolver().query(u, null, null, null, null)) {
             if (c != null && c.moveToFirst()) {
@@ -1647,7 +1438,7 @@ public class MainActivity extends Activity implements WebSession.Listener {
             }
         } catch (Exception e) { f.delete(); runOnUiThread(() -> toast("Okunamadı: " + fname)); return null; }
 
-        Att a = new Att();
+        AppCore.Att a = new AppCore.Att();
         a.id = id; a.name = name; a.mime = mime; a.size = total; a.file = f;
         if (looksText(name, mime, f) && total <= 600 * 1024) {
             try {
@@ -1679,79 +1470,11 @@ public class MainActivity extends Activity implements WebSession.Listener {
 
     private String sizeStr(long b) { return b >= 1024 * 1024 ? String.format(java.util.Locale.US, "%.1f MB", b / 1048576f) : Math.max(1, b / 1024) + " KB"; }
 
-    private void invalidateUploads(boolean restart) {
-        uploadGen++;
-        activeUpload = null;
-        boolean any = false;
-        for (Att a : atts) {
-            if (!a.text && !a.removed) {
-                a.upState = 1; a.tokens = ""; a.wname = ""; a.webIdx = -1;
-                any = true;
-            }
-        }
-        if (any) {
-            refreshAttach();
-            if (restart) pumpPreUpload();
-        }
-    }
-
-    private void pumpPreUpload() {
-        if (activeUpload != null || generating) return;
-        Att next = null;
-        for (Att a : atts) {
-            if (!a.text && !a.removed && a.upState == 1) { next = a; break; }
-        }
-        if (next == null) return;
-        if (!chat.id.equals(boundChatId) && !session.isFresh() && session.isConnected()) {
-            invalidateUploads(false);
-            session.open(site, site.newChatUrl);
-        }
-        final Att cur = next;
-        final Site upSite = site;
-        final int gen = uploadGen;
-        activeUpload = cur;
-        session.whenUsable(() -> {
-            if (gen != uploadGen || site != upSite || cur.removed || !atts.contains(cur)) {
-                if (gen == uploadGen && activeUpload == cur) {
-                    activeUpload = null;
-                    if (cur.removed && cur.file != null) cur.file.delete();
-                    pumpPreUpload();
-                }
-                return;
-            }
-            session.attachOne(new WebSession.Upload(cur.id, cur.name, cur.mime, cur.file), (ok, tokens, wname, idx, err) -> {
-                if (gen != uploadGen) {
-                    if (cur.removed && cur.file != null) cur.file.delete();
-                    return;
-                }
-                if (activeUpload == cur) activeUpload = null;
-                if (site != upSite) { pumpPreUpload(); return; }
-                if (cur.removed || !atts.contains(cur)) {
-                    if (ok) session.removeAttached(cur.name, (wname != null && !wname.isEmpty()) ? wname : cur.wname, idx);
-                    if (cur.file != null) cur.file.delete();
-                    pumpPreUpload();
-                    return;
-                }
-                if (ok) {
-                    cur.upState = 2;
-                    cur.tokens = tokens == null ? "" : tokens;
-                    cur.wname = wname == null ? "" : wname;
-                    cur.webIdx = idx;
-                } else {
-                    cur.upState = 3;
-                    toast(cur.name + " yüklenemedi" + (err != null && !err.isEmpty() ? " (" + err + ")" : ""));
-                }
-                refreshAttach();
-                pumpPreUpload();
-            });
-        });
-    }
-
     private void refreshAttach() {
         attachInner.removeAllViews();
-        attachRow.setVisibility(atts.isEmpty() ? View.GONE : View.VISIBLE);
-        for (int i = 0; i < atts.size(); i++) {
-            final Att a = atts.get(i);
+        attachRow.setVisibility(core.atts.isEmpty() ? View.GONE : View.VISIBLE);
+        for (int i = 0; i < core.atts.size(); i++) {
+            final AppCore.Att a = core.atts.get(i);
             LinearLayout chip = new LinearLayout(this);
             chip.setGravity(Gravity.CENTER_VERTICAL);
             chip.setPadding(Ui.dp(6), Ui.dp(4), Ui.dp(4), Ui.dp(4));
@@ -1774,19 +1497,19 @@ public class MainActivity extends Activity implements WebSession.Listener {
                 chip.setOnClickListener(v -> {
                     a.upState = 1;
                     refreshAttach();
-                    pumpPreUpload();
+                    core.pumpPreUpload();
                 });
             }
             ImageView x = Ui.icon(this, R.drawable.ic_close, 22, Ui.MUTED);
             x.setPadding(Ui.dp(4), Ui.dp(4), Ui.dp(4), Ui.dp(4));
             x.setOnClickListener(v -> {
-                boolean busy = (a == activeUpload);
+                boolean busy = (a == core.activeUpload);
                 a.removed = true;
                 int ridx = a.webIdx;
                 boolean wasUp = a.upState == 2;
-                atts.remove(a);
+                core.atts.remove(a);
                 if (wasUp) {
-                    for (Att o : atts) if (!o.text && o.upState == 2 && ridx >= 0 && o.webIdx > ridx) o.webIdx--;
+                    for (AppCore.Att o : core.atts) if (!o.text && o.upState == 2 && ridx >= 0 && o.webIdx > ridx) o.webIdx--;
                     session.removeAttached(a.name, a.wname, ridx);
                 }
                 if (!busy && a.file != null) a.file.delete();
@@ -1801,11 +1524,98 @@ public class MainActivity extends Activity implements WebSession.Listener {
         updateSendBtn();
     }
 
+    private void refreshCodeUi() {
+        if (modeTabs != null) modeTabs.setCode(core.codeMode);
+        if (codeBar != null && core.ws != null) codeBar.update(core.codeMode, core.ws.getDisplayPath(), core.chat.codeAuto, core.codeMode && core.ws.canUndo());
+        if (slashWrap != null && input != null) CodeUi.updateSlashBar(slashWrap, slashRow, input.getText().toString(), core.codeMode, codeHost());
+    }
+
+    private CodeUi.Host codeHost() {
+        return new CodeUi.Host() {
+            @Override public void onSelectTab(boolean code) { if (code && !core.codeMode) requestEnterCodeMode(null); else if (!code && core.codeMode) requestExitCodeMode(); }
+            @Override public void onToggleAuto() { core.chat.codeAuto = !core.chat.codeAuto; store.save(core.chat); refreshCodeUi(); core.syncCodeSystemPrompt(); toast(core.chat.codeAuto ? "İzin: Özgür (otonom)" : "İzin: Güvenli (yazma onaylı)"); }
+            @Override public void onOpenFolderPicker() { withStoragePerm(() -> CodeUi.showFolderPicker(MainActivity.this, core.ws, rel -> { core.ws.setRelDir(rel, true); core.chat.codeDir = core.ws.getRelDir(); store.save(core.chat); refreshCodeUi(); core.syncCodeSystemPrompt(); toast("Klasör: " + core.ws.getDisplayPath()); })); }
+            @Override public void onOpenFiles() { openFilesWithPerm(); }
+            @Override public void onUndo() { runUndoWithPerm(); }
+            @Override public void onSlashCommand(String cmd) { input.setText(""); handleSlashInput(cmd); }
+            @Override public void onApproveActions(List<CodeProtocol.Action> actions, boolean sendBack, LinearLayout cardBox) { core.executeCodeActions(actions, sendBack, false, (res, hasUndo) -> { if (cardBox != null) CodeUi.markCardDone(cardBox, res, sendBack, hasUndo, () -> runUndoWithPerm()); }); }
+            @Override public void onRejectActions(LinearLayout cardBox) { core.clearPendingApproval(); CodeUi.markCardRejected(cardBox); }
+            @Override public void onPreviewAction(CodeProtocol.Action a) { CodeUi.showActionPreview(MainActivity.this, a); }
+        };
+    }
+
+    private void withStoragePerm(Runnable r) {
+        if (Build.VERSION.SDK_INT <= 29 && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+            pendingPermR = r;
+            requestPermissions(new String[]{Manifest.permission.READ_EXTERNAL_STORAGE, Manifest.permission.WRITE_EXTERNAL_STORAGE}, REQ_CODE_PERM);
+            return;
+        }
+        r.run();
+    }
+
+    private boolean handleSlashInput(String typed) {
+        String lo = typed.toLowerCase(java.util.Locale.US);
+        if (lo.equals("/code") || lo.startsWith("/code ")) { String task = typed.length() > 5 ? typed.substring(5).trim() : ""; input.setText(""); requestEnterCodeMode(task.isEmpty() ? null : task); return true; }
+        if (lo.equals("/chat") || lo.equals("/normal")) { input.setText(""); if (core.codeMode) requestExitCodeMode(); else toast("Zaten normal sohbet modundasın"); return true; }
+        if (lo.equals("/files")) { input.setText(""); openFilesWithPerm(); return true; }
+        if (lo.equals("/undo")) { input.setText(""); runUndoWithPerm(); return true; }
+        if (lo.equals("/oku") || lo.startsWith("/oku ")) {
+            String extra = typed.length() > 4 ? typed.substring(4).trim() : ""; input.setText("");
+            if (!core.codeMode) requestEnterCodeMode(extra.isEmpty() ? "__OKU__" : "__OKU__:" + extra); else sendOkuTree(extra);
+            return true;
+        }
+        return false;
+    }
+
+    private void sendOkuTree(final String extra) { withStoragePerm(() -> core.sendOkuTree(extra)); }
+    private void openFilesWithPerm() {
+        withStoragePerm(() -> CodeUi.showFilesExplorer(this, core.ws, new CodeUi.FilesCb() {
+            @Override public void onTreeCmd() { if (!core.codeMode) requestEnterCodeMode("__OKU__"); else sendOkuTree(""); }
+            @Override public void onAttachRef(String relPath) { String cur = input.getText().toString(); String add = (cur.isEmpty() || cur.endsWith(" ") || cur.endsWith("\n") ? "" : " ") + relPath + " "; input.setText(cur + add); input.setSelection(input.getText().length()); toast("Eklendi: " + relPath); }
+            @Override public void onMdCreated() { if (core.codeMode) core.syncCodeSystemPrompt(); toast("RAPHAEL.md oluşturuldu"); }
+        }));
+    }
+
+    private void runUndoWithPerm() { withStoragePerm(() -> { core.runUndo(); }); }
+
+    private void requestEnterCodeMode(final String task) {
+        if (core.generating) { toast("Önce yanıtın bitmesini bekle ya da durdur"); return; }
+        if (core.site != Site.AISTUDIO) {
+            if (core.chat.msgs.isEmpty()) CodeUi.showConfirmDialog(this, "AI Studio gerekli", "Raphael Code şimdilik sadece AI Studio ile çalışır. AI Studio kaynağına geçilip Code modu açılsın mı?", "AI Studio Geç", "İptal", () -> { core.applySiteSwitch(Site.AISTUDIO, false); updateChip(); requestEnterCodeMode(task); });
+            else CodeUi.showConfirmDialog(this, "AI Studio gerekli", "Raphael Code şimdilik sadece AI Studio ile çalışır. Mevcut sohbeti AI Studio içine aktarıp Code moduna geçmek ister misin?", "Geçmişi Aktar ve Aç", "İptal", () -> { core.pendingCodeTask = task; core.openCodeAfterReply = true; core.applySiteSwitch(Site.AISTUDIO, true); updateChip(); });
+            return;
+        }
+        withStoragePerm(() -> showEnterCodeDialog(task));
+    }
+
+    private void showEnterCodeDialog(final String task) {
+        LinearLayout box = CodeUi.dialogBox(this); final Dialog d = CodeUi.themedDialog(this, box);
+        TextView tt = Ui.text(this, "Raphael Code Modu", 17, Ui.TEXT); tt.setTypeface(Typeface.SERIF, Typeface.BOLD); box.addView(tt);
+        TextView mt = Ui.text(this, "Raphael Code moduna geçilsin mi? AI Studio sistem talimatı yüklenir ve model yalnızca seçili klasörde çalışır.", 13, Ui.MUTED);
+        mt.setLineSpacing(0, 1.28f); LinearLayout.LayoutParams ml = new LinearLayout.LayoutParams(-1, -2); ml.topMargin = Ui.dp(8); box.addView(mt, ml);
+        final TextView dirBtn = Ui.pill(this, "Klasör: " + core.ws.getDisplayPath() + "  ▾", 12.5f, Ui.TEXT, Ui.SURFACE, Ui.BORDER);
+        dirBtn.setOnClickListener(v -> CodeUi.showFolderPicker(this, core.ws, rel -> { core.ws.setRelDir(rel, true); core.chat.codeDir = core.ws.getRelDir(); dirBtn.setText("Klasör: " + core.ws.getDisplayPath() + "  ▾"); }));
+        LinearLayout.LayoutParams dl = new LinearLayout.LayoutParams(-1, Ui.dp(40)); dl.topMargin = Ui.dp(12); box.addView(dirBtn, dl);
+        final TextView permBtn = Ui.pill(this, "", 12.5f, Ui.TEXT, Ui.BUBBLE, Ui.BORDER);
+        Runnable updP = () -> permBtn.setText(core.chat.codeAuto ? "İzin: Özgür (Otonom)" : "İzin: Güvenli (Okuma serbest, Yazma onaylı)");
+        updP.run(); permBtn.setOnClickListener(v -> { core.chat.codeAuto = !core.chat.codeAuto; updP.run(); });
+        LinearLayout.LayoutParams pl = new LinearLayout.LayoutParams(-1, Ui.dp(40)); pl.topMargin = Ui.dp(8); box.addView(permBtn, pl);
+        TextView b1 = Ui.pill(this, "Geç ve Hazırla", 13.5f, 0xFFFFFFFF, Ui.TEXT, 0); b1.setOnClickListener(v -> { d.dismiss(); core.activateCodeMode(task); });
+        LinearLayout.LayoutParams l1 = new LinearLayout.LayoutParams(-1, Ui.dp(42)); l1.topMargin = Ui.dp(14); box.addView(b1, l1);
+        TextView b2 = Ui.pill(this, "İptal", 13, Ui.MUTED, Ui.SURFACE, Ui.BORDER); b2.setOnClickListener(v -> d.dismiss());
+        LinearLayout.LayoutParams l2 = new LinearLayout.LayoutParams(-1, Ui.dp(40)); l2.topMargin = Ui.dp(8); box.addView(b2, l2); d.show();
+    }
+
+    private void requestExitCodeMode() {
+        if (!core.codeMode) return;
+        if (core.generating) { toast("Önce yanıtın bitmesini bekle ya da durdur"); return; }
+        CodeUi.showConfirmDialog(this, "Raphael Code Kapat", "Raphael Code modundan çıkılıp normal sohbete geçilsin mi?", "Çık", "İptal", () -> core.exitCodeMode());
+    }
     // ================================================================== küçük yardımcılar
     private void updateSendBtn() {
         if (sendBtn == null) return;
-        boolean can = generating || input.getText().toString().trim().length() > 0 || !atts.isEmpty();
-        sendBtn.setImageResource(generating ? R.drawable.ic_stop : R.drawable.ic_up);
+        boolean can = core.generating || input.getText().toString().trim().length() > 0 || !core.atts.isEmpty();
+        sendBtn.setImageResource(core.generating ? R.drawable.ic_stop : R.drawable.ic_up);
         sendBtn.setColorFilter(0xFFFFFFFF);
         sendBtn.setBackground(Ui.round(can ? Ui.TEXT : Ui.DISABLED, 20, 0, 0));
     }
