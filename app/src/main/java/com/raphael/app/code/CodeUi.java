@@ -78,7 +78,7 @@ public class CodeUi {
         row.removeAllViews(); String s = typed == null ? "" : typed.trim();
         if (!s.startsWith("/") || s.contains(" ") || s.contains("\n")) { wrap.setVisibility(View.GONE); return; }
         String q = s.toLowerCase(Locale.US);
-        String[][] cmds = codeMode ? new String[][]{{"/oku", "Klasör haritası"}, {"/files", "Dosya gezgini"}, {"/undo", "Son işlemi geri al"}, {"/chat", "Normal sohbete dön"}} : new String[][]{{"/code", "Raphael Code aç"}, {"/files", "Dosya gezgini"}, {"/oku", "Code ile klasör oku"}};
+        String[][] cmds = codeMode ? new String[][]{{"/oku", "Klasör haritası"}, {"/files", "Dosya gezgini"}, {"/undo", "Son işlemi geri al"}, {"/chat", "Normal sohbete dön"}} : new String[][]{{"/code", "Raphael Code aç"}, {"/codespaces", "Uzak Terminal (MCP)"}, {"/files", "Dosya gezgini"}, {"/oku", "Code ile klasör oku"}};
         int n = 0;
         for (final String[] cm : cmds) {
             if (!cm[0].startsWith(q)) continue; n++;

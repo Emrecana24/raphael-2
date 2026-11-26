@@ -6,6 +6,7 @@ import android.os.*;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import com.raphael.app.code.*;
+import com.raphael.app.codespaces.*;
 import com.raphael.app.data.*;
 import com.raphael.app.ui.Ui;
 import java.io.File;
@@ -22,6 +23,8 @@ public class AppCore implements WebSession.Listener {
         void onCoreAiReply(String md);
         void onCoreAiDone(Msg am, List<CodeProtocol.Action> approval);
         void onCoreCodeAutoDone(List<CodeProtocol.ExecResult> res, boolean sentBack, boolean hasUndo);
+        void onCoreCsApproval(List<CsProtocol.Action> actions);
+        void onCoreCsExecDone(List<CsProtocol.ExecResult> res, boolean sentBack);
         void onCoreAiError(String err);
         void onCoreCodeUi();
         void onCoreAttachUi();
@@ -38,6 +41,7 @@ public class AppCore implements WebSession.Listener {
     public final ChatStore store;
     public final WebSession session;
     public CodeWorkspace ws;
+    public final CsManager cs;
     public Site site = Site.GEMINI;
     public Chat chat = new Chat();
     public String boundChatId = null;
@@ -65,7 +69,7 @@ public class AppCore implements WebSession.Listener {
         ctx = c; prefs = c.getSharedPreferences("raphael", Context.MODE_PRIVATE); Ui.fontScale = prefs.getFloat("fs", 1f);
         store = new ChatStore(c); cleanUpCache(); site = Site.fromId(prefs.getString("site", "gemini"));
         session = new WebSession(c); session.setListener(this); session.setUaMode(prefs.getInt("ua", 0));
-        loadInitialChat(); ws = new CodeWorkspace(chat.codeDir); pushPrefs();
+        loadInitialChat(); ws = new CodeWorkspace(chat.codeDir); cs = new CsManager(ctx, csHost()); pushPrefs();
         if (prefs.getBoolean("codeSysDirty", false)) session.setSysPrompt("", true);
     }
 
@@ -79,17 +83,18 @@ public class AppCore implements WebSession.Listener {
     public void detachUi(UiBridge u, android.widget.FrameLayout webHost) { if (ui == u) ui = null; session.detach(webHost); }
     public void shutdown() {
         stopped = true; cancelPendingSend(); importSeq++; codeOpSeq++; uploadGen++; activeUpload = null; releaseWake();
-        h.removeCallbacks(timerR); generating = false; awaitingStart = false; codeMode = false; pendingApprovalActions = null; lastErr = null;
+        h.removeCallbacks(timerR); generating = false; awaitingStart = false; codeMode = false; pendingApprovalActions = null; cs.reset(); lastErr = null;
         session.setBgActive(false); session.destroy(); if (ui != null) ui.onCoreFinish(); ui = null;
     }
     private void acquireWake() { try { if (wakeLock == null) { PowerManager pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE); if (pm != null) { wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Raphael:BgWork"); wakeLock.setReferenceCounted(false); } } if (wakeLock != null) wakeLock.acquire(1800000L); if (wifiLock == null) { WifiManager wm = (WifiManager) ctx.getSystemService(Context.WIFI_SERVICE); if (wm != null) { wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "Raphael:WifiLock"); wifiLock.setReferenceCounted(false); } } if (wifiLock != null && !wifiLock.isHeld()) wifiLock.acquire(); } catch (Throwable ignored) {} }
     private void releaseWake() { try { if (wakeLock != null && wakeLock.isHeld()) wakeLock.release(); } catch (Throwable ignored) {} try { if (wifiLock != null && wifiLock.isHeld()) wifiLock.release(); } catch (Throwable ignored) {} }
-    private void updateBgActive() { session.setBgActive(!stopped && (generating || codeMode || activeUpload != null)); }
+    private void updateBgActive() { session.setBgActive(!stopped && (generating || codeMode || cs.isBgActive() || activeUpload != null)); }
+    private CsManager.Host csHost(){return new CsManager.Host(){public void csAcquireWake(){acquireWake();}public void csReleaseWake(){releaseWake();}public boolean csIsGenerating(){return generating;}public String csChatId(){return chat.id;}public void csUpdateStatus(){updateNotif();}public void csSendFollowup(String f,String s){sendAgentTurn(f,s);}public void csToast(String m){toast(m);}public void csUiApproval(List<CsProtocol.Action> a){if(ui!=null)ui.onCoreCsApproval(a);}public void csUiExecDone(List<CsProtocol.ExecResult> r,boolean sb){if(ui!=null)ui.onCoreCsExecDone(r,sb);}public void csUiChanged(){if(ui!=null)ui.onCoreCodeUi();}};}
     public void updateNotif() {
         if (stopped) return;
         updateBgActive();
-        String ttl = codeMode ? "Raphael Code · " + ws.getDisplayPath() : "Raphael · " + site.label;
-        String msg = generating ? (!stage.isEmpty() ? stage : awaitingStart ? "Oturum hazırlanıyor…" : gotFirstText ? (codeMode && autoTurns > 0 ? "Yazıyor… (Tur " + autoTurns + "/8)" : "Yazıyor…") : curThActive ? "Düşünüyor…" : "Yanıt bekleniyor…") : (codeMode && pendingApprovalActions != null ? "Onay bekleyen " + pendingApprovalActions.size() + " işlem var" : siteInfo);
+        String ttl = cs.isBgActive() ? "Raphael Codespaces · " + cs.curCwd : codeMode ? "Raphael Code · " + ws.getDisplayPath() : "Raphael · " + site.label;
+        String msg = cs.running ? cs.stage : (cs.mode && cs.pendingActions != null && !generating) ? "Onay bekleyen " + cs.pendingActions.size() + " komut var" : generating ? (!stage.isEmpty() ? stage : awaitingStart ? "Oturum hazırlanıyor…" : gotFirstText ? (codeMode && autoTurns > 0 ? "Yazıyor… (Tur " + autoTurns + "/8)" : "Yazıyor…") : curThActive ? "Düşünüyor…" : "Yanıt bekleniyor…") : (codeMode && pendingApprovalActions != null ? "Onay bekleyen " + pendingApprovalActions.size() + " işlem var" : siteInfo);
         RaphaelService.update(ctx, ttl, msg);
     }
     public String thinking() { String lv = prefs.getString("think_" + site.id, ""); return (site != Site.AISTUDIO && "xhigh".equals(lv)) ? "" : lv; }
@@ -100,7 +105,7 @@ public class AppCore implements WebSession.Listener {
     private void toast(String s) { if (ui != null) ui.onCoreToast(s); }
     public void applySiteSwitch(Site s, boolean transfer) {
         if (s != Site.AISTUDIO && codeMode) { codeMode = false; autoTurns = 0; if (prefs.getBoolean("codeSysDirty", false)) session.setSysPrompt("", true); if (ui != null) ui.onCoreCodeUi(); }
-        pendingApprovalActions = null; pendingApprovalChatId = null; lastErr = null; openCodeAfterReply = false; pendingCodeTask = null; codeOpSeq++;
+        pendingApprovalActions = null; pendingApprovalChatId = null; cs.reset(); lastErr = null; openCodeAfterReply = false; pendingCodeTask = null; codeOpSeq++;
         if (transfer && !chat.msgs.isEmpty()) {
             store.save(chat); String prompt = buildTransferPrompt();
             site = s; prefs.edit().putString("site", s.id).apply(); boundChatId = null; boundSite = null;
@@ -114,7 +119,7 @@ public class AppCore implements WebSession.Listener {
 
     public void applyModelSwitch(String name, boolean transfer) {
         String lbl = name.isEmpty() ? site.label + " (Varsayılan)" : name;
-        pendingApprovalActions = null; pendingApprovalChatId = null; lastErr = null; openCodeAfterReply = false; pendingCodeTask = null; codeOpSeq++;
+        pendingApprovalActions = null; pendingApprovalChatId = null; cs.reset(); lastErr = null; openCodeAfterReply = false; pendingCodeTask = null; codeOpSeq++;
         if (transfer && !chat.msgs.isEmpty()) {
             store.save(chat); String prompt = buildTransferPrompt();
             prefs.edit().putString("model_" + site.id, name).apply(); boundChatId = null; boundSite = null;
@@ -137,7 +142,7 @@ public class AppCore implements WebSession.Listener {
     public void newChat() {
         if (generating) { toast("Önce yanıtın bitmesini bekle ya da durdur"); return; }
         chat = new Chat(); chat.site = site.id; boundChatId = null; boundSite = null; lastErr = null;
-        codeMode = false; autoTurns = 0; openCodeAfterReply = false; pendingCodeTask = null; pendingApprovalActions = null; pendingApprovalChatId = null; codeOpSeq++;
+        codeMode = false; autoTurns = 0; openCodeAfterReply = false; pendingCodeTask = null; pendingApprovalActions = null; pendingApprovalChatId = null; cs.reset(); codeOpSeq++;
         ws = new CodeWorkspace(""); if (prefs.getBoolean("codeSysDirty", false)) session.setSysPrompt("", true);
         if (ui != null) { ui.onCoreChatChanged(); ui.onCoreCodeUi(); }
         boolean rel = false;
@@ -149,7 +154,7 @@ public class AppCore implements WebSession.Listener {
         if (generating) { toast("Önce yanıtın bitmesini bekle ya da durdur"); return; }
         Chat c = store.load(id); if (c == null) return;
         chat = c; boundChatId = null; boundSite = null; lastErr = null;
-        codeMode = false; autoTurns = 0; openCodeAfterReply = false; pendingCodeTask = null; pendingApprovalActions = null; pendingApprovalChatId = null; codeOpSeq++;
+        codeMode = false; autoTurns = 0; openCodeAfterReply = false; pendingCodeTask = null; pendingApprovalActions = null; pendingApprovalChatId = null; cs.reset(); codeOpSeq++;
         ws = new CodeWorkspace(chat.codeDir); if (prefs.getBoolean("codeSysDirty", false)) session.setSysPrompt("", true);
         if (ui != null) { ui.onCoreChatChanged(); ui.onCoreCodeUi(); }
         if (!atts.isEmpty() && !session.isFresh() && session.isConnected()) { session.open(site, site.newChatUrl); invalidateUploads(true); } updateNotif();
@@ -253,6 +258,7 @@ public class AppCore implements WebSession.Listener {
                 if (ui != null) ui.onCoreAiDone(am, actions); pumpPreUpload(); return;
             } else autoTurns = 0;
         }
+        if (cs.mode && cs.handleAiReply(md, () -> { if (ui != null) ui.onCoreAiDone(am, null); })) { pumpPreUpload(); return; }
         updateNotif(); if (ui != null) ui.onCoreAiDone(am, null); pumpPreUpload();
     }
 
@@ -338,7 +344,7 @@ public class AppCore implements WebSession.Listener {
     }
 
     public void exitCodeMode() {
-        codeMode = false; autoTurns = 0; openCodeAfterReply = false; pendingCodeTask = null; pendingApprovalActions = null; pendingApprovalChatId = null; codeOpSeq++;
+        codeMode = false; autoTurns = 0; openCodeAfterReply = false; pendingCodeTask = null; pendingApprovalActions = null; pendingApprovalChatId = null; cs.reset(); codeOpSeq++;
         if (ui != null) ui.onCoreCodeUi(); updateNotif();
         final boolean hadMsgs = !chat.msgs.isEmpty(); final int myOp = codeOpSeq;
         final String bye = "[Sistem Bilgisi]: Raphael Code modu kapatıldı. Artık rph dosya/klasör komut blokları yazma; normal sohbet asistanı olarak kurallarsız devam et.";
@@ -376,14 +382,14 @@ public class AppCore implements WebSession.Listener {
     public void runUndo() { String msg = ws.undoLast(); if (ui != null) ui.onCoreCodeUi(); toast(msg); }
     public void finishImportedChat(Chat c) {
         store.save(c); chat = c; boundChatId = c.id; boundSite = Site.GEMINI; lastErr = null;
-        codeMode = false; autoTurns = 0; openCodeAfterReply = false; pendingCodeTask = null; pendingApprovalActions = null; pendingApprovalChatId = null; codeOpSeq++;
+        codeMode = false; autoTurns = 0; openCodeAfterReply = false; pendingCodeTask = null; pendingApprovalActions = null; pendingApprovalChatId = null; cs.reset(); codeOpSeq++;
         ws = new CodeWorkspace(c.codeDir); if (prefs.getBoolean("codeSysDirty", false)) session.setSysPrompt("", true);
         if (ui != null) { ui.onCoreChatChanged(); ui.onCoreCodeUi(); }
         invalidateUploads(true); updateNotif();
     }
     public void deleteAllChats() {
         store.deleteAll(); chat = new Chat(); chat.site = site.id; boundChatId = null; boundSite = null; lastErr = null;
-        codeMode = false; autoTurns = 0; openCodeAfterReply = false; pendingCodeTask = null; pendingApprovalActions = null; pendingApprovalChatId = null; codeOpSeq++;
+        codeMode = false; autoTurns = 0; openCodeAfterReply = false; pendingCodeTask = null; pendingApprovalActions = null; pendingApprovalChatId = null; cs.reset(); codeOpSeq++;
         ws = new CodeWorkspace(""); if (prefs.getBoolean("codeSysDirty", false)) session.setSysPrompt("", true);
         if (ui != null) { ui.onCoreChatChanged(); ui.onCoreCodeUi(); }
         updateNotif();

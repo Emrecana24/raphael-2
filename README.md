@@ -7,8 +7,9 @@ Android (native Java) hafif AI sohbet kabuğu. Gemini (`gemini.google.com`) ve A
 - Codespaces (Ubuntu): Geliştirici telefondan çalışır. Komutlar tek satırda ve tek kod bloğu içinde verilmeli (iç içe üçlü backtick kullanılmamalı), çıktı `rm -f kontrol.txt` sonrası `kontrol.txt` dosyasına yazılmalı; mobil yapıştırma için komutlar kısa tutulmalıdır.
 - Tasarım: Mevcut sıcak tema (`14.5sp`) ve Web sekmesindeki Arka plan görüntü kapalı modu RAM tasarrufu için korunmalıdır.
 
-## v4.0 (1. Asama)
-- Arka planda uzun yanit ve agentic dongulerin kesilmemesi icin BgWebView gorunurluk korumasi, RENDERER_PRIORITY_IMPORTANT, WifiLock, yenilenen WakeLock ve document.hidden kilidi.
+## v4.0 Yenilikler
+- Arka Plan Stabilitesi: Uzun yanit ve agentic dongulerin arka planda durmamasi icin BgWebView gorunurluk korumasi, RENDERER_PRIORITY_IMPORTANT, WifiLock, yenilenen WakeLock, moveTaskToBack ve document.hidden kilidi.
+- Raphael Codespaces (MCP): Izole codespaces/ paketi ve assets/codespaces_mcp.md ile /codespaces komutu; uzak Ubuntu terminaline Bearer anahtarli asenkron job_id + yoklama koprusu.
 
 ## v3.0 Yenilikler
 - **Raphael Code (2. Aşama):** `/sdcard/raphael/` içinde `CodeWorkspace`, `CodeProtocol` (`rph` komutları) ve `CodeUi` (`Raphael | Code` sekmeleri, `/code`, `/oku`, `/files`, `/undo`, `/chat`, `RAPHAEL.md`, Güvenli/Özgür mod, onay kartları, `.raphael_undo/`) ile AI Studio dosya/kod ajanı.
