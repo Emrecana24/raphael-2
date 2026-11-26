@@ -135,6 +135,7 @@ public class MainActivity extends Activity implements AppCore.UiBridge {
     public void onBackPressed() {
         if (drawerScrim.getVisibility() == View.VISIBLE) { closeDrawer(); return; }
         if (webMode) { showWeb(false); return; }
+        if (core != null && (core.generating || core.codeMode)) { moveTaskToBack(true); return; }
         super.onBackPressed();
     }
 

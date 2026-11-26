@@ -1,5 +1,6 @@
 /* ===== Raphael ortak yardımcılar (her sitenin betiğinden önce eklenir) ===== */
 var VER = 7;
+try{Object.defineProperty(document,'hidden',{get:function(){return false;},configurable:true});Object.defineProperty(document,'visibilityState',{get:function(){return 'visible';},configurable:true});}catch(e){}
 var Q = function (s, r) { try { return (r || document).querySelector(s); } catch (e) { return null; } };
 var QA = function (s, r) { try { return Array.prototype.slice.call((r || document).querySelectorAll(s)); } catch (e) { return []; } };
 var sleep = function (ms) { return new Promise(function (res) { setTimeout(res, ms); }); };

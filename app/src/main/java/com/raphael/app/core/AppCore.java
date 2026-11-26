@@ -1,5 +1,6 @@
 package com.raphael.app.core;
 import android.content.*;
+import android.net.wifi.WifiManager;
 import android.net.Uri;
 import android.os.*;
 import android.webkit.ValueCallback;
@@ -54,6 +55,7 @@ public class AppCore implements WebSession.Listener {
     public List<CodeProtocol.Action> pendingApprovalActions = null;
     private Runnable pendingSendR, pendingTimeoutR;
     private PowerManager.WakeLock wakeLock;
+    private WifiManager.WifiLock wifiLock;
     private UiBridge ui;
 
     public static synchronized AppCore get(Context c) { if (inst == null) inst = new AppCore(c.getApplicationContext()); return inst; }
@@ -78,12 +80,14 @@ public class AppCore implements WebSession.Listener {
     public void shutdown() {
         stopped = true; cancelPendingSend(); importSeq++; codeOpSeq++; uploadGen++; activeUpload = null; releaseWake();
         h.removeCallbacks(timerR); generating = false; awaitingStart = false; codeMode = false; pendingApprovalActions = null; lastErr = null;
-        session.destroy(); if (ui != null) ui.onCoreFinish(); ui = null;
+        session.setBgActive(false); session.destroy(); if (ui != null) ui.onCoreFinish(); ui = null;
     }
-    private void acquireWake() { try { if (wakeLock == null) { PowerManager pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE); if (pm != null) wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Raphael:BgWork"); } if (wakeLock != null && !wakeLock.isHeld()) wakeLock.acquire(600000L); } catch (Throwable ignored) {} }
-    private void releaseWake() { try { if (wakeLock != null && wakeLock.isHeld()) wakeLock.release(); } catch (Throwable ignored) {} }
+    private void acquireWake() { try { if (wakeLock == null) { PowerManager pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE); if (pm != null) { wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Raphael:BgWork"); wakeLock.setReferenceCounted(false); } } if (wakeLock != null) wakeLock.acquire(1800000L); if (wifiLock == null) { WifiManager wm = (WifiManager) ctx.getSystemService(Context.WIFI_SERVICE); if (wm != null) { wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "Raphael:WifiLock"); wifiLock.setReferenceCounted(false); } } if (wifiLock != null && !wifiLock.isHeld()) wifiLock.acquire(); } catch (Throwable ignored) {} }
+    private void releaseWake() { try { if (wakeLock != null && wakeLock.isHeld()) wakeLock.release(); } catch (Throwable ignored) {} try { if (wifiLock != null && wifiLock.isHeld()) wifiLock.release(); } catch (Throwable ignored) {} }
+    private void updateBgActive() { session.setBgActive(!stopped && (generating || codeMode || activeUpload != null)); }
     public void updateNotif() {
         if (stopped) return;
+        updateBgActive();
         String ttl = codeMode ? "Raphael Code · " + ws.getDisplayPath() : "Raphael · " + site.label;
         String msg = generating ? (!stage.isEmpty() ? stage : awaitingStart ? "Oturum hazırlanıyor…" : gotFirstText ? (codeMode && autoTurns > 0 ? "Yazıyor… (Tur " + autoTurns + "/8)" : "Yazıyor…") : curThActive ? "Düşünüyor…" : "Yanıt bekleniyor…") : (codeMode && pendingApprovalActions != null ? "Onay bekleyen " + pendingApprovalActions.size() + " işlem var" : siteInfo);
         RaphaelService.update(ctx, ttl, msg);
@@ -284,7 +288,7 @@ public class AppCore implements WebSession.Listener {
     @Override public void onNote(String msg) { if (ui != null) ui.onCoreNote(msg); }
 
     public void invalidateUploads(boolean restart) {
-        uploadGen++; activeUpload = null; boolean any = false;
+        uploadGen++; activeUpload = null; updateBgActive(); boolean any = false;
         for (Att a : atts) if (!a.text && !a.removed) { a.upState = 1; a.tokens = ""; a.wname = ""; a.webIdx = -1; any = true; }
         if (any) { if (ui != null) ui.onCoreAttachUi(); if (restart) pumpPreUpload(); }
     }
@@ -294,12 +298,12 @@ public class AppCore implements WebSession.Listener {
         for (Att a : atts) if (!a.text && !a.removed && a.upState == 1) { next = a; break; }
         if (next == null) return;
         if (!chat.id.equals(boundChatId) && !session.isFresh() && session.isConnected()) { invalidateUploads(false); session.open(site, site.newChatUrl); }
-        final Att cur = next; final Site upSite = site; final int gen = uploadGen; activeUpload = cur;
+        final Att cur = next; final Site upSite = site; final int gen = uploadGen; activeUpload = cur; updateBgActive();
         session.whenUsable(() -> {
             if (gen != uploadGen || site != upSite || cur.removed || !atts.contains(cur)) { if (gen == uploadGen && activeUpload == cur) { activeUpload = null; if (cur.removed && cur.file != null) cur.file.delete(); pumpPreUpload(); } return; }
             session.attachOne(new WebSession.Upload(cur.id, cur.name, cur.mime, cur.file), (ok, tokens, wname, idx, err) -> {
                 if (gen != uploadGen) { if (cur.removed && cur.file != null) cur.file.delete(); return; }
-                if (activeUpload == cur) activeUpload = null; if (site != upSite) { pumpPreUpload(); return; }
+                if (activeUpload == cur) { activeUpload = null; updateBgActive(); } if (site != upSite) { pumpPreUpload(); return; }
                 if (cur.removed || !atts.contains(cur)) { if (ok) session.removeAttached(cur.name, (wname != null && !wname.isEmpty()) ? wname : cur.wname, idx); if (cur.file != null) cur.file.delete(); pumpPreUpload(); return; }
                 if (ok) { cur.upState = 2; cur.tokens = tokens == null ? "" : tokens; cur.wname = wname == null ? "" : wname; cur.webIdx = idx; }
                 else { cur.upState = 3; toast(cur.name + " yüklenemedi" + (err != null && !err.isEmpty() ? " (" + err + ")" : "")); }
@@ -355,6 +359,7 @@ public class AppCore implements WebSession.Listener {
 
     public void executeCodeActions(final List<CodeProtocol.Action> actions, final boolean sendBack, final boolean countTurn, final ApproveCb cb) {
         final String turnChatId = chat.id; final int seq = codeOpSeq; pendingApprovalActions = null; pendingApprovalChatId = null; updateNotif();
+        if (sendBack) acquireWake();
         new Thread(() -> {
             final List<CodeProtocol.ExecResult> res = new ArrayList<>(); for (CodeProtocol.Action a : actions) res.add(CodeProtocol.executeOne(ws, a));
             final String feedback = CodeProtocol.formatFeedback(res, ws); final boolean hasUndo = ws.canUndo();
@@ -362,7 +367,7 @@ public class AppCore implements WebSession.Listener {
             h.post(() -> {
                 if (ui != null) ui.onCoreCodeUi(); if (cb != null) cb.done(res, hasUndo); else if (ui != null) ui.onCoreCodeAutoDone(res, sendBack, hasUndo);
                 if (sendBack && seq == codeOpSeq && codeMode && !generating && chat.id.equals(turnChatId)) { if (countTurn) autoTurns++; else autoTurns = 0; sendAgentTurn(feedback, "⚙️ " + okCnt + "/" + res.size() + " işlem → modele iletildi"); }
-                else updateNotif();
+                else { if (sendBack && !generating) releaseWake(); updateNotif(); }
             });
         }).start();
     }

@@ -1,6 +1,7 @@
 package com.raphael.app.core;
 
 import android.content.Context;
+import android.view.View;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.net.Uri;
@@ -75,7 +76,16 @@ public class WebSession {
     private final Context ctx;
     private final Handler h = new Handler(Looper.getMainLooper());
     private FrameLayout host;
-    private WebView web;
+    private BgWebView web;
+    private boolean bgActive = false;
+    private boolean keepBgVisible() { return !destroyed && (bgActive || tracking || !ops.isEmpty() || !queue.isEmpty()); }
+    public void setBgActive(boolean on) { bgActive = on; if (web != null && !destroyed) web.syncBgVisibility(); }
+    private class BgWebView extends WebView {
+        BgWebView(Context c) { super(c); }
+        @Override protected void onWindowVisibilityChanged(int v) { super.onWindowVisibilityChanged(keepBgVisible() ? VISIBLE : v); }
+        @Override protected void onVisibilityChanged(View cv, int v) { super.onVisibilityChanged(cv, keepBgVisible() ? VISIBLE : v); }
+        void syncBgVisibility() { boolean kv = keepBgVisible(); super.onWindowVisibilityChanged(kv ? VISIBLE : getWindowVisibility()); super.onVisibilityChanged(this, kv ? VISIBLE : getVisibility()); if (kv) { onResume(); resumeTimers(); } }
+    }
     private Listener lis;
     private Site site = Site.GEMINI;
 
@@ -126,6 +136,7 @@ public class WebSession {
         if (web != null && host != null) {
             if (web.getParent() instanceof android.view.ViewGroup) ((android.view.ViewGroup) web.getParent()).removeView(web);
             host.addView(web, new FrameLayout.LayoutParams(-1, -1));
+            if (keepBgVisible()) web.post(() -> { if (web != null && !destroyed) web.syncBgVisibility(); });
         }
     }
     public void detach(FrameLayout oldHost) {
@@ -142,7 +153,8 @@ public class WebSession {
     @SuppressWarnings("SetJavaScriptEnabled")
     private void ensureWeb() {
         if (web != null) return;
-        web = new WebView(ctx);
+        web = new BgWebView(ctx);
+        web.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false);
         WebSettings s = web.getSettings();
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
