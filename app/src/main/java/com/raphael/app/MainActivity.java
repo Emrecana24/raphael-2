@@ -1536,19 +1536,20 @@ public class MainActivity extends Activity implements AppCore.UiBridge {
     private void refreshCodeUi() {
         if (modeTabs != null) modeTabs.setCode(core.codeMode);
         if (codeBar != null && core.ws != null) codeBar.update(core.codeMode, core.ws.getDisplayPath(), core.chat.codeAuto, core.codeMode && core.ws.canUndo());
-        if (csBar != null) csBar.update(core.cs.isBgActive(), core.cs.curCwd, core.cs.cfg.isAuto(), core.cs.running);
+        if (csBar != null) csBar.update(core.cs.isBgActive(), core.cs.curCwd, core.cs.cfg.isAuto(), core.cs.running, core.cs.canUndo);
         if (slashWrap != null && input != null) CodeUi.updateSlashBar(slashWrap, slashRow, input.getText().toString(), core.codeMode, codeHost());
     }
 
     private CsUi.Host csUiHost() { return new CsUi.Host() {
         public void onCsToggleAuto() { boolean na = !core.cs.cfg.isAuto(); core.cs.cfg.setAuto(na); refreshCodeUi(); core.updateNotif(); toast(na ? "Codespaces: Ozgur" : "Codespaces: Guvenli"); }
-        public void onCsConfig() { CsUi.showConfigDialog(MainActivity.this, core.cs, () -> { refreshCodeUi(); core.updateNotif(); if (!core.cs.mode) core.cs.activate(""); }); }
+        public void onCsConfig() { CsUi.showConfigDialog(MainActivity.this, core.cs, () -> { refreshCodeUi(); core.updateNotif(); if (!core.cs.mode) withStoragePerm(() -> core.cs.activate("")); }); }
         public void onCsStop() { core.cs.stopRunning(); }
+        public void onCsUndo() { core.cs.runUndo(); }
         public void onCsExit() { if (core.generating || core.cs.running) { toast("Once aktif islemi durdur"); return; } core.cs.deactivate(true, !core.chat.msgs.isEmpty()); }
         public void onCsApprove(List<CsProtocol.Action> a, boolean sb, LinearLayout c) { core.cs.execute(a, sb, false, r -> CsUi.markCardDone(c, r, sb)); }
         public void onCsReject(LinearLayout c) { core.cs.clearPending(); CsUi.markCardRejected(c); }
     }; }
-    private void startCodespaces(String t) { if (core.generating) { toast("Once yaniti bekle ya da durdur"); return; } if (core.codeMode) { toast("Once /chat ile Code modundan cik"); return; } if (!core.cs.cfg.isConfigured()) { CsUi.showConfigDialog(this, core.cs, () -> core.cs.activate(t)); return; } core.cs.activate(t); }
+    private void startCodespaces(final String t) { if (core.generating) { toast("Once yaniti bekle ya da durdur"); return; } if (core.codeMode) { toast("Once /chat ile Code modundan cik"); return; } withStoragePerm(() -> { if (!core.cs.cfg.isConfigured()) { CsUi.showConfigDialog(MainActivity.this, core.cs, () -> core.cs.activate(t)); return; } core.cs.activate(t); }); }
     private CodeUi.Host codeHost() {
         return new CodeUi.Host() {
             @Override public void onSelectTab(boolean code) { if (code && !core.codeMode) requestEnterCodeMode(null); else if (!code && core.codeMode) requestExitCodeMode(); }

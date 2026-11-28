@@ -4,8 +4,9 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 import java.io.*;
 import java.util.*;
+import java.util.zip.*;
 public class CodeWorkspace {
-    public static class Result { public final boolean ok; public final String summary, output; public Result(boolean o, String s, String out) { ok = o; summary = s; output = out; } }
+    public static class Result { public final boolean ok; public final String summary, output; public final List<File> files; public Result(boolean o, String s, String out) { this(o, s, out, Collections.emptyList()); } public Result(boolean o, String s, String out, List<File> fs) { ok = o; summary = s; output = out; files = fs; } }
     public static class FileItem { public final String name, relPath; public final boolean isDir; public final long size; public FileItem(String n, String r, boolean d, long s) { name = n; relPath = r; isDir = d; size = s; } }
     private final File root; private String activeRel = "";
     public CodeWorkspace(String relDir) { root = new File(Environment.getExternalStorageDirectory(), "raphael"); if (!root.exists()) root.mkdirs(); setRelDir(relDir, false); }
@@ -151,6 +152,63 @@ public class CodeWorkspace {
             if (f.delete()) return new Result(true, "Silindi: " + rp, "OK: Silindi: " + rp);
             return new Result(false, "Silinemedi", "HATA: Silinemedi");
         } catch (Exception e) { return new Result(false, "Silme hatası", "HATA: " + e.getMessage()); }
+    }
+    public Result attach(String path) {
+        try {
+            if (path == null || path.trim().isEmpty()) return new Result(false, "Yol bos", "HATA: @attach icin yol belirt");
+            File t = resolve(path, true), base = activeDir().getCanonicalFile();
+            if (!t.exists()) return new Result(false, "Yok", "HATA: Bulunamadi: " + path);
+            List<File> fs = new ArrayList<>();
+            if (t.isFile()) {
+                if (t.length() <= 0) return new Result(false, "Bos", "HATA: 0 byte dosya yuklenemez");
+                if (t.length() > 30L * 1024 * 1024) return new Result(false, "Buyuk", "HATA: 30 MB siniri asildi");
+                fs.add(t);
+            } else {
+                long[] tot = {0}; collectAttach(t, fs, tot, 12);
+                if (fs.isEmpty()) return new Result(false, "Bos", "HATA: Klasorde dosya yok");
+                if (fs.size() > 8) return new Result(false, "Cok dosya", "HATA: Klasorde 8+ dosya var; tek sec veya @zip kullan");
+                if (tot[0] > 30L * 1024 * 1024) return new Result(false, "Buyuk", "HATA: Toplam > 30 MB; @zip kullan");
+            }
+            StringBuilder sb = new StringBuilder("EKLENECEK (" + fs.size() + "):\n");
+            for (File f : fs) sb.append("- ").append(relOf(base, f)).append(" (").append(sizeStr(f.length())).append(")\n");
+            return new Result(true, fs.size() + " dosya hazir", sb.toString().trim(), fs);
+        } catch (Exception e) { return new Result(false, "Hata", "HATA: " + e.getMessage()); }
+    }
+    private void collectAttach(File dir, List<File> out, long[] tot, int cap) {
+        if (out.size() >= cap) return; File[] ks = dir.listFiles(); if (ks == null) return;
+        Arrays.sort(ks, (a, b) -> a.getName().compareToIgnoreCase(b.getName()));
+        for (File f : ks) { if (out.size() >= cap) break; if (skipName(f.getName())) continue; if (f.isDirectory()) collectAttach(f, out, tot, cap); else if (f.length() > 0) { out.add(f); tot[0] += f.length(); } }
+    }
+    public Result zip(List<String> raw) {
+        try {
+            if (raw == null || raw.isEmpty()) return new Result(false, "Eksik", "HATA: @zip hedef.zip kaynak...");
+            String oa; List<String> srcs = new ArrayList<>();
+            if (raw.size() == 1) { String x = raw.get(0), cl = cleanRel(x);
+                if (x.toLowerCase(Locale.US).endsWith(".zip") && !resolve(x, true).exists()) { oa = x; srcs.add("."); }
+                else { srcs.add(x); String nm = (cl.isEmpty() || cl.equals(".") || cl.equals("raphael")) ? (activeRel.isEmpty() ? "raphael" : new File(activeRel).getName()) : new File(cl).getName(); oa = (nm.toLowerCase(Locale.US).endsWith(".zip") ? nm + "_p" : nm) + ".zip"; }
+            } else { String f0 = raw.get(0), fn = raw.get(raw.size() - 1);
+                if (f0.toLowerCase(Locale.US).endsWith(".zip")) { oa = f0; srcs.addAll(raw.subList(1, raw.size())); }
+                else if (fn.toLowerCase(Locale.US).endsWith(".zip")) { oa = fn; srcs.addAll(raw.subList(0, raw.size() - 1)); }
+                else if (raw.size() == 2 && resolve(f0, true).exists() && !resolve(fn, false).exists()) { srcs.add(f0); oa = fn + ".zip"; }
+                else { oa = "paket.zip"; srcs.addAll(raw); }
+            }
+            File b = activeDir().getCanonicalFile(), outF = resolve(oa, false); if (outF.isDirectory()) return new Result(false, "Klasor", "HATA: Hedef klasor");
+            List<File> sfs = new ArrayList<>(); for (String x : srcs) { File f = resolve(x, true); if (!f.exists()) return new Result(false, "Yok", "HATA: Kaynak yok: " + x); sfs.add(f); }
+            if (outF.getParentFile() != null) outF.getParentFile().mkdirs(); File tmp = new File(outF.getPath() + ".tmp"); int[] cnt = {0}; long[] bs = {0};
+            String oc = outF.getCanonicalPath(), tc = tmp.getCanonicalPath(); Set<String> seen = new HashSet<>();
+            try (ZipOutputStream zos = new ZipOutputStream(new BufferedOutputStream(new FileOutputStream(tmp)))) {
+                for (File sf : sfs) addZip(sf, sf.equals(b) ? "" : sf.getName(), zos, oc, tc, seen, cnt, bs);
+            } catch (Exception ze) { tmp.delete(); throw ze; }
+            if (cnt[0] == 0) { tmp.delete(); return new Result(false, "Bos", "HATA: Dosya yok"); }
+            backupForUndo("WRITE", outF, null); if (outF.exists()) outF.delete(); if (!tmp.renameTo(outF)) { copyFile(tmp, outF); tmp.delete(); }
+            String rp = relOf(b, outF); return new Result(true, "ZIP: " + rp + " (" + cnt[0] + ", " + sizeStr(outF.length()) + ")", "OK: " + rp + " (" + cnt[0] + " dosya, " + sizeStr(outF.length()) + ")");
+        } catch (Exception e) { return new Result(false, "ZIP hatasi", "HATA: " + e.getMessage()); }
+    }
+    private void addZip(File f, String en, ZipOutputStream zos, String oc, String tc, Set<String> seen, int[] cnt, long[] bs) throws Exception {
+        String fc = f.getCanonicalPath(); if (fc.equals(oc) || fc.equals(tc) || (!en.isEmpty() && skipName(f.getName()))) return;
+        if (f.isDirectory()) { File[] ks = f.listFiles(); if (ks == null) return; Arrays.sort(ks, (x, y) -> x.getName().compareToIgnoreCase(y.getName())); for (File k : ks) addZip(k, en.isEmpty() ? k.getName() : en + "/" + k.getName(), zos, oc, tc, seen, cnt, bs); return; }
+        if (!f.isFile()) return; if (cnt[0] >= 2000) throw new IllegalStateException("2000 dosya siniri"); bs[0] += f.length(); if (bs[0] > 50L * 1024 * 1024) throw new IllegalStateException("50 MB siniri"); if (!seen.add(en)) return;
+        zos.putNextEntry(new ZipEntry(en)); try (InputStream in = new FileInputStream(f)) { byte[] buf = new byte[16384]; int n; while ((n = in.read(buf)) > 0) zos.write(buf, 0, n); } zos.closeEntry(); cnt[0]++;
     }
     private File undoDir() { File d = new File(root, ".raphael_undo"); if (!d.exists()) d.mkdirs(); return d; }
     private JSONArray readUndoMeta() { try { File m = new File(undoDir(), "meta.json"); if (m.isFile()) return new JSONArray(readAll(m)); } catch (Exception ignored) {} return new JSONArray(); }

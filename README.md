@@ -1,4 +1,4 @@
-# Raphael (v3.0)
+# Raphael (v5.0)
 
 Android (native Java) hafif AI sohbet kabuğu. Gemini (`gemini.google.com`) ve AI Studio (`aistudio.google.com`) web arayüzlerini tek oturumlu arka plan WebView içinde çalıştırır.
 
@@ -6,6 +6,10 @@ Android (native Java) hafif AI sohbet kabuğu. Gemini (`gemini.google.com`) ve A
 - Hedef: Samsung Galaxy A8 (Android 8 / minSdk 26, targetSdk 34, 3 GB RAM), sıfır harici kütüphane.
 - Codespaces (Ubuntu): Geliştirici telefondan çalışır. Komutlar tek satırda ve tek kod bloğu içinde verilmeli (iç içe üçlü backtick kullanılmamalı), çıktı `rm -f kontrol.txt` sonrası `kontrol.txt` dosyasına yazılmalı; mobil yapıştırma için komutlar kısa tutulmalıdır.
 - Tasarım: Mevcut sıcak tema (`14.5sp`) ve Web sekmesindeki Arka plan görüntü kapalı modu RAM tasarrufu için korunmalıdır.
+
+## v5.0 Yenilikler
+- Raphael Code Dosya Alma & ZIP: @attach (dosya, gorsel veya 8 dosyaya kadar klasor yukleme) ve @zip (geri alma destekli paketleme).
+- Raphael Codespaces MCP v2: ~/.raphael-cs/server.py uzerinden Code-benzeri yapisal dosya islemleri (@tree, @list, @read, @search, @mkdir, @write, @patch, @move, @delete, @zip, @undo), /workspaces/raphael-2 baslangicli tam erisim, @pull/@attach ile /sdcard/raphael/codespaces/ altina cekme-yukleme ve istege bagli sinirsiz otonom tur ayari.
 
 ## v4.0 Yenilikler
 - Arka Plan Stabilitesi: Uzun yanit ve agentic dongulerin arka planda durmamasi icin BgWebView gorunurluk korumasi, RENDERER_PRIORITY_IMPORTANT, WifiLock, yenilenen WakeLock, moveTaskToBack ve document.hidden kilidi.

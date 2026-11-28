@@ -1,11 +1,12 @@
 package com.raphael.app.code;
+import java.io.File;
 import java.util.*;
 public class CodeProtocol {
-    public enum Op { TREE, LIST, READ, SEARCH, MKDIR, WRITE, PATCH, MOVE, DELETE }
+    public enum Op { TREE, LIST, READ, SEARCH, MKDIR, WRITE, PATCH, MOVE, DELETE, ATTACH, ZIP }
     public static class Action {
-        public Op op; public String arg1 = "", arg2 = "", text1 = "", text2 = ""; public int lineStart = 0, lineEnd = 0;
+        public Op op; public String arg1 = "", arg2 = "", text1 = "", text2 = ""; public int lineStart = 0, lineEnd = 0; public final List<String> args = new ArrayList<>();
         public Action(Op o) { op = o; }
-        public boolean isReadOnly() { return op == Op.TREE || op == Op.LIST || op == Op.READ || op == Op.SEARCH; }
+        public boolean isReadOnly() { return op == Op.TREE || op == Op.LIST || op == Op.READ || op == Op.SEARCH || op == Op.ATTACH; }
         public String label() {
             switch (op) {
                 case TREE: return "Ağaç: " + (arg1.isEmpty() ? "." : arg1);
@@ -17,6 +18,8 @@ public class CodeProtocol {
                 case PATCH: return "Düzenle: " + arg1;
                 case MOVE: return "Taşı: " + arg1 + " -> " + arg2;
                 case DELETE: return "Sil: " + arg1;
+                case ATTACH: return "Dosya al: " + arg1;
+                case ZIP: return "ZIP paketle: " + arg1 + (arg2.isEmpty() ? "" : " <- " + arg2);
             } return op.name();
         }
         public String preview() {
@@ -25,9 +28,9 @@ public class CodeProtocol {
             return "";
         }
     }
-    public static class ExecResult { public final Action action; public final boolean ok; public final String summary, output; public ExecResult(Action a, boolean o, String s, String out) { action = a; ok = o; summary = s; output = out; } }
+    public static class ExecResult { public final Action action; public final boolean ok; public final String summary, output; public final List<File> files; public ExecResult(Action a, boolean o, String s, String out) { this(a, o, s, out, Collections.emptyList()); } public ExecResult(Action a, boolean o, String s, String out, List<File> fs) { action = a; ok = o; summary = s; output = out; files = fs == null ? Collections.emptyList() : fs; } }
     public static String buildSystemPrompt(String displayDir, boolean autoMode, boolean hasRaphaelMd) {
-        String modeNote = autoMode ? "ÖZGÜR (OTONOM) MOD AKTİF: Okuma, yazma, yama, taşıma ve silme komutların aktif çalışma klasöründe doğrudan uygulanır ve sonuçlar sana geri iletilir." : "GÜVENLİ (ONAYLI) MOD AKTİF: @tree, @list, @read ve @search komutların otomatik çalışır. @mkdir, @write, @patch, @move ve @delete komutların ise kullanıcı onayından sonra uygulanır.";
+        String modeNote = autoMode ? "ÖZGÜR (OTONOM) MOD AKTİF: Okuma, yazma, yama, taşıma ve silme komutların aktif çalışma klasöründe doğrudan uygulanır ve sonuçlar sana geri iletilir." : "GÜVENLİ (ONAYLI) MOD AKTİF: @tree, @list, @read, @search ve @attach komutların otomatik çalışır. @mkdir, @write, @patch, @move, @delete ve @zip komutların ise kullanıcı onayından sonra uygulanır.";
         String mdHint = hasRaphaelMd ? "Klasörde RAPHAEL.md mevcut; göreve başlamadan önce @read RAPHAEL.md ile proje notlarını oku." : "Klasörde henüz RAPHAEL.md yok (@read RAPHAEL.md çağırma). Proje büyürse önemli notları RAPHAEL.md dosyasına kaydedebilirsin.";
         return "Sen Raphael Code asistanısın. Kullanıcının Android cihazındaki yerel çalışma alanında dosya işlemleri yapabiliyorsun.\n"
             + "AKTİF ÇALIŞMA DİZİNİ: " + displayDir + "\n"
@@ -37,10 +40,10 @@ public class CodeProtocol {
             + "1. Klasörü tanımak için @tree kullan (dosya ve alt klasörleri tek seferde görürsün); gereksiz yere tüm dosyaları okuma.\n"
             + "2. " + mdHint + "\n"
             + "3. Büyük dosyalarda @search ile ilgili yeri bul, @read dosya 1-120 şeklinde sadece gereken satırları oku.\n"
-            + "4. Küçük değişikliklerde bütün dosyayı @write ile baştan yazmak yerine @patch kullan.\n"
+            + "4. Küçük değişikliklerde bütün dosyayı @write ile baştan yazmak yerine @patch kullan. Görsel, ZIP veya dosya/klasör almak için @attach yol; paketlemek için @zip kullan.\n"
             + "5. Komut bloğu yazdıktan sonra sonucu kendin tahmin etme; uygulamadan gelecek [RAPHAEL SONUÇLARI] yanıtını bekle.\n\n"
             + "KOMUT DİLİ: Sadece işlem yaptırmak istediğinde cevabına rph kod bloğu ekle (normal kod örnekleri için rph kullanma):\n"
-            + "````rph\n@tree [alt_klasor]\n@list [alt_klasor]\n@read dosya.txt [baslangic-bitis]\n@search kelime [alt_klasor]\n@mkdir klasor\n@move eski yeni\n@delete dosya\n@write dosya.txt\n<<<EOF\niçerik\n<<<END\n@patch dosya.txt\n<<<OLD\neski satırlar\n<<<NEW\nyeni satırlar\n<<<END\n````";
+            + "````rph\n@tree [alt_klasor]\n@list [alt_klasor]\n@read dosya.txt [baslangic-bitis]\n@search kelime [alt_klasor]\n@mkdir klasor\n@move eski yeni\n@delete dosya\n@attach dosya_veya_klasor\n@zip paket.zip kaynak...\n@write dosya.txt\n<<<EOF\niçerik\n<<<END\n@patch dosya.txt\n<<<OLD\neski satırlar\n<<<NEW\nyeni satırlar\n<<<END\n````";
     }
     public static List<Action> parseActions(String md) {
         List<Action> out = new ArrayList<>(); if (md == null || md.isEmpty()) return out;
@@ -78,6 +81,8 @@ public class CodeProtocol {
             else if (cmd.equals("delete") || cmd.equals("del") || cmd.equals("rm")) { Action a = new Action(Op.DELETE); a.arg1 = a1; out.add(a); }
             else if (cmd.equals("write")) { cur = new Action(Op.WRITE); cur.arg1 = a1; }
             else if (cmd.equals("patch")) { cur = new Action(Op.PATCH); cur.arg1 = a1; }
+            else if (cmd.equals("attach") || cmd.equals("upload") || cmd.equals("yukle") || cmd.equals("al")) { if (ps.size() <= 2) { Action a = new Action(Op.ATTACH); a.arg1 = a1; out.add(a); } else for (int k = 1; k < ps.size(); k++) { Action a = new Action(Op.ATTACH); a.arg1 = ps.get(k); out.add(a); } }
+            else if (cmd.equals("zip") || cmd.equals("pack")) { Action a = new Action(Op.ZIP); for (int k = 1; k < ps.size(); k++) a.args.add(ps.get(k)); a.arg1 = a1; if (ps.size() > 2) a.arg2 = String.join(" ", ps.subList(2, ps.size())); out.add(a); }
         } return out;
     }
     private static boolean allChar(String s, char ch) { for (int i = 0; i < s.length(); i++) if (s.charAt(i) != ch) return false; return true; }
@@ -100,8 +105,8 @@ public class CodeProtocol {
             case READ: r = ws.read(a.arg1, a.lineStart, a.lineEnd); break; case SEARCH: r = ws.search(a.arg1, a.arg2); break;
             case MKDIR: r = ws.mkdir(a.arg1); break; case WRITE: r = ws.write(a.arg1, a.text1); break;
             case PATCH: r = ws.patch(a.arg1, a.text1, a.text2); break; case MOVE: r = ws.move(a.arg1, a.arg2); break;
-            case DELETE: r = ws.delete(a.arg1); break; default: r = new CodeWorkspace.Result(false, "Bilinmeyen", "HATA"); break;
-        } return new ExecResult(a, r.ok, r.summary, r.output);
+            case DELETE: r = ws.delete(a.arg1); break; case ATTACH: r = ws.attach(a.arg1); break; case ZIP: r = ws.zip(a.args.isEmpty() && !a.arg1.isEmpty() ? Collections.singletonList(a.arg1) : a.args); break; default: r = new CodeWorkspace.Result(false, "Bilinmeyen", "HATA"); break;
+        } return new ExecResult(a, r.ok, r.summary, r.output, r.files);
     }
     public static String formatFeedback(List<ExecResult> res, CodeWorkspace ws) {
         StringBuilder sb = new StringBuilder("[RAPHAEL SONUÇLARI | Dizin: " + ws.getDisplayPath() + "]\n\n");

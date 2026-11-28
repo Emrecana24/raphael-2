@@ -10,6 +10,9 @@ public class CsConfig {
     public void setToken(String t) { p.edit().putString("token", t == null ? "" : t.trim()).apply(); }
     public boolean isAuto() { return p.getBoolean("auto", false); }
     public void setAuto(boolean a) { p.edit().putBoolean("auto", a).apply(); }
+    public boolean isUnlimited() { return p.getBoolean("unlimited", false); }
+    public void setUnlimited(boolean u) { p.edit().putBoolean("unlimited", u).apply(); }
+    public static java.io.File localRoot(Context c) { java.io.File d = new java.io.File(android.os.Environment.getExternalStorageDirectory(), "raphael/codespaces"); if (!d.exists()) d.mkdirs(); if (!d.isDirectory()) { d = new java.io.File(c.getExternalFilesDir(null), "codespaces"); d.mkdirs(); } return d; }
     public int getTimeout() { return Math.max(10, Math.min(900, p.getInt("timeout", 180))); }
     public void setTimeout(int s) { p.edit().putInt("timeout", Math.max(10, Math.min(900, s))).apply(); }
     public boolean isConfigured() { return !getUrl().isEmpty() && !getToken().isEmpty(); }

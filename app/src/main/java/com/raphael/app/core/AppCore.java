@@ -9,7 +9,7 @@ import com.raphael.app.code.*;
 import com.raphael.app.codespaces.*;
 import com.raphael.app.data.*;
 import com.raphael.app.ui.Ui;
-import java.io.File;
+import java.io.*;
 import java.util.*;
 
 public class AppCore implements WebSession.Listener {
@@ -89,12 +89,12 @@ public class AppCore implements WebSession.Listener {
     private void acquireWake() { try { if (wakeLock == null) { PowerManager pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE); if (pm != null) { wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Raphael:BgWork"); wakeLock.setReferenceCounted(false); } } if (wakeLock != null) wakeLock.acquire(1800000L); if (wifiLock == null) { WifiManager wm = (WifiManager) ctx.getSystemService(Context.WIFI_SERVICE); if (wm != null) { wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "Raphael:WifiLock"); wifiLock.setReferenceCounted(false); } } if (wifiLock != null && !wifiLock.isHeld()) wifiLock.acquire(); } catch (Throwable ignored) {} }
     private void releaseWake() { try { if (wakeLock != null && wakeLock.isHeld()) wakeLock.release(); } catch (Throwable ignored) {} try { if (wifiLock != null && wifiLock.isHeld()) wifiLock.release(); } catch (Throwable ignored) {} }
     private void updateBgActive() { session.setBgActive(!stopped && (generating || codeMode || cs.isBgActive() || activeUpload != null)); }
-    private CsManager.Host csHost(){return new CsManager.Host(){public void csAcquireWake(){acquireWake();}public void csReleaseWake(){releaseWake();}public boolean csIsGenerating(){return generating;}public String csChatId(){return chat.id;}public void csUpdateStatus(){updateNotif();}public void csSendFollowup(String f,String s){sendAgentTurn(f,s);}public void csToast(String m){toast(m);}public void csUiApproval(List<CsProtocol.Action> a){if(ui!=null)ui.onCoreCsApproval(a);}public void csUiExecDone(List<CsProtocol.ExecResult> r,boolean sb){if(ui!=null)ui.onCoreCsExecDone(r,sb);}public void csUiChanged(){if(ui!=null)ui.onCoreCodeUi();}};}
+    private CsManager.Host csHost(){return new CsManager.Host(){public void csAcquireWake(){acquireWake();}public void csReleaseWake(){releaseWake();}public boolean csIsGenerating(){return generating;}public String csChatId(){return chat.id;}public void csUpdateStatus(){updateNotif();}public void csSendFollowup(String f,String s,List<File> fs){if(fs==null||fs.isEmpty()){sendAgentTurn(f,s);return;}List<WebSession.Upload> ups=new ArrayList<>();List<String> th=new ArrayList<>();StringBuilder nm=new StringBuilder();stageFiles(fs,ups,th,nm);String sh=(nm.length()>0?"\ud83d\udcce "+nm+"\n":"")+s;sendAgentTurn(f,sh,ups,th);}public void csToast(String m){toast(m);}public void csUiApproval(List<CsProtocol.Action> a){if(ui!=null)ui.onCoreCsApproval(a);}public void csUiExecDone(List<CsProtocol.ExecResult> r,boolean sb){if(ui!=null)ui.onCoreCsExecDone(r,sb);}public void csUiChanged(){if(ui!=null)ui.onCoreCodeUi();}};}
     public void updateNotif() {
         if (stopped) return;
         updateBgActive();
         String ttl = cs.isBgActive() ? "Raphael Codespaces · " + cs.curCwd : codeMode ? "Raphael Code · " + ws.getDisplayPath() : "Raphael · " + site.label;
-        String msg = cs.running ? cs.stage : (cs.mode && cs.pendingActions != null && !generating) ? "Onay bekleyen " + cs.pendingActions.size() + " komut var" : generating ? (!stage.isEmpty() ? stage : awaitingStart ? "Oturum hazırlanıyor…" : gotFirstText ? (codeMode && autoTurns > 0 ? "Yazıyor… (Tur " + autoTurns + "/8)" : "Yazıyor…") : curThActive ? "Düşünüyor…" : "Yanıt bekleniyor…") : (codeMode && pendingApprovalActions != null ? "Onay bekleyen " + pendingApprovalActions.size() + " işlem var" : siteInfo);
+        String msg = cs.running ? cs.stage : (cs.mode && cs.pendingActions != null && !generating) ? "Onay bekleyen " + cs.pendingActions.size() + " komut var" : generating ? (!stage.isEmpty() ? stage : awaitingStart ? "Oturum hazırlanıyor…" : gotFirstText ? (cs.mode && cs.autoTurns > 0 ? (cs.cfg.isUnlimited() ? "Yaz\u0131yor\u2026 (CS Tur " + cs.autoTurns + ")" : "Yaz\u0131yor\u2026 (CS Tur " + cs.autoTurns + "/8)") : codeMode && autoTurns > 0 ? "Yaz\u0131yor\u2026 (Tur " + autoTurns + "/8)" : "Yaz\u0131yor\u2026") : curThActive ? "Düşünüyor…" : "Yanıt bekleniyor…") : (codeMode && pendingApprovalActions != null ? "Onay bekleyen " + pendingApprovalActions.size() + " işlem var" : siteInfo);
         RaphaelService.update(ctx, ttl, msg);
     }
     public String thinking() { String lv = prefs.getString("think_" + site.id, ""); return (site != Site.AISTUDIO && "xhigh".equals(lv)) ? "" : lv; }
@@ -183,7 +183,8 @@ public class AppCore implements WebSession.Listener {
         sendMsgInternal(full.toString(), shown, ups, imgs, 0, null); return true;
     }
 
-    public void sendAgentTurn(String fullText, String shownText) { if (!generating) sendMsgInternal(fullText, shownText, new ArrayList<>(), null, 0, null); }
+    public void sendAgentTurn(String fullText, String shownText) { sendAgentTurn(fullText, shownText, new ArrayList<>(), null); }
+    public void sendAgentTurn(String fullText, String shownText, List<WebSession.Upload> ups, List<String> imgs) { if (!generating) sendMsgInternal(fullText, shownText, ups == null ? new ArrayList<>() : ups, imgs, 0, null); }
 
     private void sendMsgInternal(String fullText, String shownText, List<WebSession.Upload> ups, List<String> imgNames, int delayMs, String banner) {
         boolean boundOk = chat.id.equals(boundChatId) && boundSite == site && session.isConnected();
@@ -369,15 +370,34 @@ public class AppCore implements WebSession.Listener {
         new Thread(() -> {
             final List<CodeProtocol.ExecResult> res = new ArrayList<>(); for (CodeProtocol.Action a : actions) res.add(CodeProtocol.executeOne(ws, a));
             final String feedback = CodeProtocol.formatFeedback(res, ws); final boolean hasUndo = ws.canUndo();
+            final List<WebSession.Upload> ups = new ArrayList<>(); final List<String> thumbs = new ArrayList<>(); final StringBuilder upN = new StringBuilder();
+            if (sendBack) stageCodeUploads(res, ups, thumbs, upN);
             int ok = 0; for (CodeProtocol.ExecResult er : res) if (er.ok) ok++; final int okCnt = ok;
             h.post(() -> {
                 if (ui != null) ui.onCoreCodeUi(); if (cb != null) cb.done(res, hasUndo); else if (ui != null) ui.onCoreCodeAutoDone(res, sendBack, hasUndo);
-                if (sendBack && seq == codeOpSeq && codeMode && !generating && chat.id.equals(turnChatId)) { if (countTurn) autoTurns++; else autoTurns = 0; sendAgentTurn(feedback, "⚙️ " + okCnt + "/" + res.size() + " işlem → modele iletildi"); }
+                if (sendBack && seq == codeOpSeq && codeMode && !generating && chat.id.equals(turnChatId)) { if (countTurn) autoTurns++; else autoTurns = 0; String sh = (upN.length() > 0 ? "\ud83d\udcce " + upN + "\n" : "") + "\u2699\ufe0f " + okCnt + "/" + res.size() + " i\u015flem \u2192 modele iletildi"; sendAgentTurn(feedback, sh, ups, thumbs); }
                 else { if (sendBack && !generating) releaseWake(); updateNotif(); }
             });
         }).start();
     }
 
+    private void stageCodeUploads(List<CodeProtocol.ExecResult> res, List<WebSession.Upload> ups, List<String> thumbs, StringBuilder names) { List<File> all = new ArrayList<>(); for (CodeProtocol.ExecResult er : res) all.addAll(er.files); stageFiles(all, ups, thumbs, names); }
+    private void stageFiles(List<File> fs, List<WebSession.Upload> ups, List<String> thumbs, StringBuilder names) {
+        File upDir = new File(ctx.getCacheDir(), "up"); upDir.mkdirs(); Set<String> seen = new HashSet<>(); long tot = 0;
+        for (File f : fs) {
+            if (!f.isFile() || ups.size() >= 8) continue;
+            String k; try { k = f.getCanonicalPath(); } catch (Exception e) { k = f.getPath(); }
+            if (!seen.add(k) || tot + f.length() > 30L * 1024 * 1024) continue;
+            tot += f.length(); String id = Long.toHexString(System.nanoTime()) + "_" + ups.size(), nm = f.getName(), mm = guessMime(nm);
+            File dst = new File(upDir, id + "_" + nm.replaceAll("[^a-zA-Z0-9._-]", "_"));
+            try { copyStream(f, dst); ups.add(new WebSession.Upload(id, nm, mm, dst)); if (names.length() > 0) names.append(", "); names.append(nm);
+                if (mm.startsWith("image/")) { int d = nm.lastIndexOf("."); String ex = d >= 0 ? nm.substring(d + 1).toLowerCase(Locale.US) : "png"; File th = store.img("a_" + id + "." + ex); copyStream(dst, th); thumbs.add(th.getName()); }
+            } catch (Exception ignored) {}
+        }
+    }
+    private static void copyStream(File a, File b) throws Exception { try (InputStream in = new FileInputStream(a); OutputStream out = new FileOutputStream(b)) { byte[] buf = new byte[32768]; int n; while ((n = in.read(buf)) > 0) out.write(buf, 0, n); } }
+    private static String guessMime(String nm) { int i = nm.lastIndexOf("."); String e = i < 0 ? "" : nm.substring(i + 1).toLowerCase(Locale.US);
+        switch (e) { case "png": return "image/png"; case "jpg": case "jpeg": return "image/jpeg"; case "gif": return "image/gif"; case "webp": return "image/webp"; case "pdf": return "application/pdf"; case "zip": return "application/zip"; case "mp3": return "audio/mpeg"; case "wav": return "audio/wav"; case "mp4": return "video/mp4"; case "txt": case "md": case "csv": return "text/plain"; case "json": return "application/json"; case "html": case "htm": return "text/html"; default: return "application/octet-stream"; } }
     public void clearPendingApproval() { pendingApprovalActions = null; pendingApprovalChatId = null; updateNotif(); }
     public void runUndo() { String msg = ws.undoLast(); if (ui != null) ui.onCoreCodeUi(); toast(msg); }
     public void finishImportedChat(Chat c) {
